@@ -12,8 +12,7 @@ import (
 
 	"github.com/avereha/pod/pkg/message"
 	"github.com/davecgh/go-spew/spew"
-	"github.com/paypal/gatt"
-	"github.com/paypal/gatt/linux/cmd"
+	"github.com/bettercap/gatt"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -46,16 +45,6 @@ type Ble struct {
 
 	dataNotifier    gatt.Notifier
 	dataNotifierMtx sync.Mutex
-}
-
-var DefaultServerOptions = []gatt.Option{
-	gatt.LnxMaxConnections(1),
-	gatt.LnxDeviceID(-1, true),
-	gatt.LnxSetAdvertisingParameters(&cmd.LESetAdvertisingParameters{
-		AdvertisingIntervalMin: 0x00f4,
-		AdvertisingIntervalMax: 0x00f4,
-		AdvertisingChannelMap:  0x7,
-	}),
 }
 
 func New(adapterID string, podId []byte) (*Ble, error) {
