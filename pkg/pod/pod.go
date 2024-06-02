@@ -413,10 +413,10 @@ func (p *Pod) getResponse(cmd command.Command) response.Response {
 	var rsp response.Response
 
 	getStatus, isStatusRequest := cmd.(*command.GetStatus)
-	if !isStatusRequest || getStatus.RequestType == 0 {
-		// Not a get status command or a type 0 get status
+	if !isStatusRequest || getStatus.RequestType == 0 || getStatus.RequestType == 7 {
+		// Not a get status command or a type 0 or type 7 get status
 		if p.state.FaultEvent == 0 {
-			// Pod is not faulted, return a general status response
+			// Pod is not faulted, return a general status response for the type 0 or 7 get status
 			rsp = p.makeGeneralStatusResponse()
 		} else {
 			// Pod is faulted, return a detailed status response
@@ -435,7 +435,7 @@ func (p *Pod) getResponse(cmd command.Command) response.Response {
 			rsp = p.makeType5StatusResponse()
 		default:
 			// Includes 0x46, 0x50, 0x51 and the nack responses that are all hardcoded
-			log.Fatal("pkg pod; getStatus: unexpected type 0x%x", getStatus.RequestType)
+			log.Fatalf("pkg pod; getStatus: unexpected type 0x%x", getStatus.RequestType)
 		}
 	}
 
@@ -454,6 +454,23 @@ func (p *Pod) clearAlerts(alertMask uint8) {
 }
 
 func (p *Pod) handleCommand(cmd command.Command) {
+
+	// this progress advancement happens in the pump control logic in a real pod
+	if p.state.PodProgress == response.PodProgressPriming {
+		// if enough time has passed for priming to finish, advance PodProgress
+		if p.state.BolusEnd.Before(time.Now()) {
+			log.Infof("*** Advancing progress to PodProgressPrimingCompleted as prime bolus has ended")
+			p.state.PodProgress = response.PodProgressPrimingCompleted
+		}
+	}
+	if p.state.PodProgress == response.PodProgressInsertingCannula {
+		// if enough time has passed for cannula insert bolus to finish, advance PodProgress
+		if p.state.BolusEnd.Before(time.Now()) {
+			log.Infof("*** Advancing progress to PodProgressRunningAbove50U as cannula insert bolus has ended")
+			p.state.PodProgress = response.PodProgressRunningAbove50U
+		}
+	}
+
 	if crashBeforeProcessingCommand && cmd.DoesMutatePodState() {
 		log.Fatalf("pkg pod; Crashing before processing command with sequence %d", cmd.GetSeq())
 	}
@@ -466,21 +483,7 @@ func (p *Pod) handleCommand(cmd command.Command) {
 		p.state.PodProgress = response.PodProgressPairingCompleted
 
 	case *command.GetStatus: // 0x0E
-		now := time.Now()
-		if p.state.PodProgress == response.PodProgressPriming {
-			// if enough time has passed for priming to finish, advance PodProgress
-			if p.state.BolusEnd.Before(now) {
-				log.Infof("*** Advancing progress to PodProgressPrimingCompleted as prime bolus has ended")
-				p.state.PodProgress = response.PodProgressPrimingCompleted
-			}
-		}
-		if p.state.PodProgress == response.PodProgressInsertingCannula && !p.state.BolusEnd.After(now) {
-			// if enough time has passed for cannula insert bolus to finish, advance PodProgress
-			if p.state.BolusEnd.Before(now) {
-				log.Infof("*** Advancing progress to PodProgressRunningAbove50U as cannula insert bolus has ended")
-				p.state.PodProgress = response.PodProgressRunningAbove50U
-			}
-		}
+		break
 
 	case *command.SilenceAlerts: // 0x11
 		// clears the ActiveAlertSlots bits and Trigger Times for the specified alerts
@@ -503,8 +506,6 @@ func (p *Pod) handleCommand(cmd command.Command) {
 		} else if p.state.PodProgress < response.PodProgressInsertingCannula {
 			// this must be the insert cannula command
 			p.state.PodProgress = response.PodProgressInsertingCannula
-		} else if p.state.PodProgress < response.PodProgressRunningAbove50U {
-			p.state.PodProgress = response.PodProgressRunningAbove50U
 		}
 
 		// Programming basal schedule
@@ -522,7 +523,7 @@ func (p *Pod) handleCommand(cmd command.Command) {
 		if c.TableNum == 2 {
 			p.state.Delivered += c.Pulses
 			p.state.Reservoir -= c.Pulses
-			if p.state.PodProgress > response.PodProgressInsertingCannula {
+			if p.state.PodProgress >= response.PodProgressRunningAbove50U {
 				p.state.BolusEnd = time.Now().Add(time.Duration(c.Pulses) * time.Second * 2)
 			} else {
 				p.state.BolusEnd = time.Now().Add(time.Duration(c.Pulses) * time.Second) // one sec/pulse during pod setup

@@ -74,14 +74,19 @@ func (p *PODState) MinutesActive() uint16 {
 	return uint16(time.Now().Sub(p.ActivationTime).Round(time.Minute).Minutes())
 }
 
+// NOTE: only handles immediate boluses; any extended bolus is not accounted for
 func (p *PODState) BolusRemaining() uint16 {
 	now := time.Now()
+	var secondsPerPulse uint16
 	if p.BolusEnd.After(now) {
+		// Add one so the response for a bolus command has a bolus remaining value that matches the bolus size
+		bolusSecondsRemaining := uint16(p.BolusEnd.Sub(now).Seconds() + 1)
 		if p.PodProgress > response.PodProgressInsertingCannula {
-			return uint16(p.BolusEnd.Sub(now).Seconds()) / 2
+			secondsPerPulse = 2 // normal immediate bolus rate
 		} else {
-			return uint16(p.BolusEnd.Sub(now).Seconds()) // one sec/pulse during pod setup
+			secondsPerPulse = 1 // pod setup bolus rate
 		}
+		return bolusSecondsRemaining / secondsPerPulse
 	} else {
 		return 0
 	}
