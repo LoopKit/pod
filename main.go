@@ -32,6 +32,7 @@ func main() {
 	log.SetFormatter(&logrus.TextFormatter{
 		DisableQuote: true,
 		ForceColors:  true,
+		FullTimestamp: true,
 	})
 
 	// TODO: This is kinda ugly, move state reader into own file and pass state to both BLE and pod
