@@ -46,7 +46,6 @@ func (g *ProgramAlerts) DoesMutatePodState() bool {
 }
 
 func (g *ProgramAlerts) GetResponse() (response.Response, error) {
-	// TODO improve responses
 	return &response.GeneralStatusResponse{}, nil
 }
 

@@ -37,7 +37,6 @@ func (g *StopDelivery) DoesMutatePodState() bool {
 }
 
 func (g *StopDelivery) GetResponse() (response.Response, error) {
-	// TODO improve responses
 	return &response.GeneralStatusResponse{}, nil
 }
 
