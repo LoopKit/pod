@@ -12,7 +12,6 @@ type ProgramBeeps struct {
 
 func UnmarshalProgramBeeps(data []byte) (*ProgramBeeps, error) {
 	ret := &ProgramBeeps{}
-	// TODO deserialize this command
 	log.Debugf("ProgramBeeps, 0x1e, received, data %x", data)
 	return ret, nil
 }
@@ -30,7 +29,6 @@ func (g *ProgramBeeps) DoesMutatePodState() bool {
 }
 
 func (g *ProgramBeeps) GetResponse() (response.Response, error) {
-	// TODO improve responses
 	return &response.GeneralStatusResponse{}, nil
 }
 

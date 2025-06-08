@@ -31,7 +31,6 @@ func (g *SilenceAlerts) DoesMutatePodState() bool {
 }
 
 func (g *SilenceAlerts) GetResponse() (response.Response, error) {
-	// TODO improve responses
 	return &response.GeneralStatusResponse{}, nil
 }
 

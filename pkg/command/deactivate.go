@@ -12,7 +12,6 @@ type Deactivate struct {
 
 func UnmarshalDeactivate(data []byte) (*Deactivate, error) {
 	ret := &Deactivate{}
-	// TODO deserialize this command
 	log.Debugf("Deactivate, 0x1c, received, data %x", data)
 	return ret, nil
 }
@@ -30,8 +29,7 @@ func (g *Deactivate) DoesMutatePodState() bool {
 }
 
 func (g *Deactivate) GetResponse() (response.Response, error) {
-	// TODO improve responses
-	return &response.DeactivateResponse{}, nil
+	return &response.GeneralStatusResponse{}, nil
 }
 
 func (g *Deactivate) SetHeaderData(seq uint8, id []byte) error {

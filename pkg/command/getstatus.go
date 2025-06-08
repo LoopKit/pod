@@ -15,7 +15,6 @@ func UnmarshalGetStatus(data []byte) (*GetStatus, error) {
 	ret := &GetStatus{}
 
 	ret.RequestType = data[1]
-	// TODO deserialize this command
 	log.Debugf("GetStatus, 0x0e, received, data %x", data)
 
 	return ret, nil

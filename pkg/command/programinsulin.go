@@ -15,7 +15,6 @@ type ProgramInsulin struct {
 
 func UnmarshalProgramInsulin(data []byte) (*ProgramInsulin, error) {
 	ret := &ProgramInsulin{}
-	// TODO deserialize this command
 	log.Debugf("ProgramInsulin, 0x1a, received, data %x", data)
 
 	// 1a LL NNNNNNNN 02 CCCC HH SSSS PPPP 0ppp
@@ -39,7 +38,6 @@ func (g *ProgramInsulin) DoesMutatePodState() bool {
 }
 
 func (g *ProgramInsulin) GetResponse() (response.Response, error) {
-	// TODO improve responses
 	return &response.GeneralStatusResponse{}, nil
 }
 
