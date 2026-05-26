@@ -7,12 +7,18 @@ import (
 	toml "github.com/pelletier/go-toml"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/avereha/pod/pkg/pair"
 	"github.com/avereha/pod/pkg/response"
 )
 
 type PODState struct {
 	LTK       []byte `toml:"ltk"`
 	EapAkaSeq uint64 `toml:"eap_aka_seq"`
+
+	// Mode is the active pairing mode (Dash or O5) that selects which
+	// response variants the simulator produces. Persisted so the bytes the
+	// pod returns to the controller stay consistent across restarts.
+	Mode pair.Mode `toml:"mode"`
 
 	Id []byte `toml:"id"` // 4 byte
 
@@ -24,6 +30,19 @@ type PODState struct {
 
 	NoncePrefix []byte `toml:"nonce_prefix"`
 	CK          []byte `toml:"ck"`
+
+	// O5 pairing identity: a P-256 ECDSA private key (raw 32-byte scalar)
+	// and a self-signed DER X.509 certificate wrapping the matching public
+	// key. Used to sign the SPS2 channel-binding transcript and to satisfy
+	// OmnipodKit's `extractP256PublicKey(fromDERCert:)`. Generated once on
+	// first activation and reused thereafter.
+	O5PrivateKey []byte `toml:"o5_private_key"`
+	O5CertDER    []byte `toml:"o5_cert_der"`
+
+	// PDMPublicKey is the 64-byte raw P-256 public key (X||Y) extracted from
+	// the PDM's TLS leaf cert during SPS2. Used to verify ECDSA signatures
+	// on inbound Type-4 commands (programBolus, programBasal).
+	PDMPublicKey []byte `toml:"pdm_public_key"`
 
 	PodProgress    response.PodProgress
 	ActivationTime time.Time `toml:"activation_time"`
@@ -68,6 +87,30 @@ func (p *PODState) Save() error {
 		return err
 	}
 	return ioutil.WriteFile(p.Filename, data, 0777)
+}
+
+// ResolveMode picks the effective pairing mode for this process, honouring
+// persisted state across restarts so the operator doesn't silently rewrite
+// an O5 state.toml to Dash by forgetting the -mode flag.
+//
+// Precedence:
+//
+//   - freshState=true: the CLI flag wins; caller is expected to persist it.
+//   - freshState=false: state.Mode wins. If it differs from the CLI flag,
+//     conflict=true is reported so the caller can warn the operator. The
+//     resolved value is still the persisted one (use -fresh to override).
+//
+// Because pair.ModeDash is the zero value, a legacy state file written
+// before the mode field existed deserializes as ModeDash, which lines up
+// with the default CLI flag and produces no conflict.
+func ResolveMode(state *PODState, flagMode pair.Mode, freshState bool) (resolved pair.Mode, conflict bool) {
+	if freshState || state == nil {
+		return flagMode, false
+	}
+	if state.Mode != flagMode {
+		return state.Mode, true
+	}
+	return state.Mode, false
 }
 
 func (p *PODState) MinutesActive() uint16 {

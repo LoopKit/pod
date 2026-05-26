@@ -5,9 +5,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/avereha/pod/pkg/aid"
 	"github.com/avereha/pod/pkg/bluetooth"
 	"github.com/avereha/pod/pkg/command"
 	"github.com/avereha/pod/pkg/eap"
+	"github.com/avereha/pod/pkg/message"
 	"github.com/avereha/pod/pkg/pair"
 
 	"github.com/avereha/pod/pkg/encrypt"
@@ -31,6 +33,7 @@ type PodMsgBody struct {
 type Pod struct {
 	ble            *bluetooth.Ble
 	state          *PODState
+	pairMode       pair.Mode
 	mtx            sync.Mutex
 	webMessageHook func([]byte)
 }
@@ -39,7 +42,7 @@ type Pod struct {
 var crashBeforeProcessingCommand bool
 var crashAfterProcessingCommand bool
 
-func New(ble *bluetooth.Ble, stateFile string, freshState bool) *Pod {
+func New(ble *bluetooth.Ble, stateFile string, freshState bool, pairMode pair.Mode) *Pod {
 	var err error
 
 	state := &PODState{
@@ -54,9 +57,31 @@ func New(ble *bluetooth.Ble, stateFile string, freshState bool) *Pod {
 		}
 	}
 
+	// Mirror the active pair mode onto persisted state so response-layer
+	// code (which doesn't see the Pod struct) can pick the right Dash/O5
+	// byte stream. On a fresh start the CLI flag is authoritative and we
+	// persist it. On a restart we leave state.Mode alone: the caller is
+	// expected to have already reconciled the CLI flag against state.Mode
+	// via ResolveMode and to pass the resolved value in here, so silently
+	// overwriting would corrupt the persisted mode whenever the operator
+	// forgot the -mode flag. See pkg/pod/state.go ResolveMode.
+	if freshState {
+		state.Mode = pairMode
+		if err := state.Save(); err != nil {
+			log.Warnf("pkg pod; could not persist pair mode to state: %s", err)
+		}
+	} else if state.Mode != pairMode {
+		// Defensive: caller forgot to reconcile. Trust the resolved
+		// pairMode argument for in-memory routing without rewriting
+		// the persisted value, and log loudly so the bug is visible.
+		log.Warnf("pkg pod; persisted mode %q != resolved mode %q passed to pod.New; in-memory routing will use the argument but state.toml will NOT be overwritten",
+			state.Mode, pairMode)
+	}
+
 	ret := &Pod{
-		ble:   ble,
-		state: state,
+		ble:      ble,
+		state:    state,
+		pairMode: pairMode,
 	}
 
 	return ret
@@ -87,6 +112,73 @@ func (p *Pod) notifyStateChange() {
 	}
 }
 
+// handleAIDCommand parses a decrypted AID setup command, builds the matching
+// ASCII response, encrypts it, and writes it back to the controller. It also
+// handles the post-response ACK round-trip that the existing CommandLoop does
+// inline for standard commands.
+//
+// Caller must hold p.mtx. This function does NOT release the mutex.
+func (p *Pod) handleAIDCommand(reqMsg *message.Message, plaintext []byte) {
+	cmd, err := aid.Parse(plaintext)
+	if err != nil {
+		log.Errorf("pkg pod; AID parse failed: %s", err)
+		return
+	}
+	log.Infof("pkg pod; AID %d %s.%s data=%q", cmd.Kind, cmd.Feature, cmd.Attribute, string(cmd.Data))
+
+	respPayload := cmd.BuildResponse()
+	log.Infof("pkg pod; AID response: %q", string(respPayload))
+
+	p.state.MsgSeq++
+	rsp := message.NewMessage(message.MessageTypeEncrypted, reqMsg.Destination, reqMsg.Source)
+	rsp.Payload = respPayload
+	rsp.SequenceNumber = p.state.MsgSeq
+	rsp.Ack = true
+	rsp.AckNumber = reqMsg.SequenceNumber + 1
+	rsp.Eqos = 1
+
+	encrypted, err := encrypt.EncryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, rsp)
+	if err != nil {
+		log.Fatalf("pkg pod; AID encrypt response: %s", err)
+	}
+	p.state.NonceSeq++
+	p.state.Save()
+	p.ble.WriteMessage(encrypted)
+
+	// Read the controller's ACK and advance the nonce counter so subsequent
+	// messages stay in sync.
+	ackMsg, _ := p.ble.ReadMessage()
+	if ackMsg != nil {
+		ackPlain, err := encrypt.DecryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, ackMsg)
+		if err != nil {
+			log.Warnf("pkg pod; AID ACK decrypt failed: %s", err)
+		} else if len(ackPlain.Payload) != 0 {
+			log.Warnf("pkg pod; AID ACK had non-empty payload (%d bytes); ignoring", len(ackPlain.Payload))
+		}
+		p.state.NonceSeq++
+	}
+	p.state.Save()
+}
+
+// ensurePodIdentity returns the pod's stable P-256 keypair + self-signed cert,
+// generating and persisting it on first use. Each pod simulator instance has
+// a stable cryptographic identity once activated, mirroring real pods.
+func (p *Pod) ensurePodIdentity() (*pair.PodIdentity, error) {
+	if len(p.state.O5PrivateKey) > 0 && len(p.state.O5CertDER) > 0 {
+		return pair.LoadPodIdentity(p.state.O5PrivateKey, p.state.O5CertDER)
+	}
+	id, err := pair.NewPodIdentity()
+	if err != nil {
+		return nil, err
+	}
+	p.state.O5PrivateKey = id.PrivateScalar()
+	p.state.O5CertDER = id.CertDER
+	if err := p.state.Save(); err != nil {
+		log.Warnf("pkg pod; could not persist pod identity: %s", err)
+	}
+	return id, nil
+}
+
 func (p *Pod) StartAcceptingCommands() {
 	log.Infof("pkg pod; Listening for commands")
 	firstCmd, _ := p.ble.ReadCmd()
@@ -103,30 +195,53 @@ func (p *Pod) StartAcceptingCommands() {
 
 func (p *Pod) StartActivation() {
 
-	pair := &pair.Pair{}
+	pairCtx := &pair.Pair{Mode: p.pairMode}
+
+	if pairCtx.IsO5() {
+		identity, err := p.ensurePodIdentity()
+		if err != nil {
+			log.Fatalf("pkg pod; could not load/create pod identity: %s", err)
+		}
+		pairCtx.SetIdentity(identity)
+	}
+
 	msg, _ := p.ble.ReadMessage()
-	if err := pair.ParseSP1SP2(msg); err != nil {
+	if err := pairCtx.ParseSP1SP2(msg); err != nil {
 		log.Fatalf("pkg pod; error parsing SP1SP2 %s", err)
 	}
 	// read PDM public key and nonce
 	msg, _ = p.ble.ReadMessage()
-	if err := pair.ParseSPS1(msg); err != nil {
+	if err := pairCtx.ParseSPS1(msg); err != nil {
 		log.Fatalf("pkg pod; error parsing SPS1 %s", err)
 	}
 
-	msg, err := pair.GenerateSPS1()
+	msg, err := pairCtx.GenerateSPS1()
 	if err != nil {
 		log.Fatal(err)
 	}
 	// send POD public key and nonce
 	p.ble.WriteMessage(msg)
 
+	if pairCtx.IsO5() {
+		// O5 inserts SPS2.1 (intermediate-CA cert exchange) between SPS1 and SPS2.
+		msg, _ = p.ble.ReadMessage()
+		if err := pairCtx.ParseSPS21(msg); err != nil {
+			log.Fatalf("pkg pod; error parsing SPS2.1 %s", err)
+		}
+
+		msg, err = pairCtx.GenerateSPS21()
+		if err != nil {
+			log.Fatal(err)
+		}
+		p.ble.WriteMessage(msg)
+	}
+
 	// read PDM conf value
 	msg, _ = p.ble.ReadMessage()
-	pair.ParseSPS2(msg)
+	pairCtx.ParseSPS2(msg)
 
 	// send POD conf value
-	msg, err = pair.GenerateSPS2()
+	msg, err = pairCtx.GenerateSPS2()
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -134,23 +249,27 @@ func (p *Pod) StartActivation() {
 
 	// receive SP0GP0 constant from PDM
 	msg, _ = p.ble.ReadMessage()
-	err = pair.ParseSP0GP0(msg)
+	err = pairCtx.ParseSP0GP0(msg)
 	if err != nil {
 		log.Fatalf("pkg pod; could not parse SP0GP0: %s", err)
 	}
 
 	// send P0 constant
-	msg, err = pair.GenerateP0()
+	msg, err = pairCtx.GenerateP0()
 	if err != nil {
 		log.Fatal(err)
 	}
 	p.ble.WriteMessage(msg)
 
-	p.state.LTK, err = pair.LTK()
+	p.state.LTK, err = pairCtx.LTK()
 	if err != nil {
 		log.Fatalf("pkg pod; could not get LTK %s", err)
 	}
 	log.Infof("pkg pod; LTK %x", p.state.LTK)
+	if pdmKey := pairCtx.PDMPublicKey(); pdmKey != nil {
+		p.state.PDMPublicKey = pdmKey
+		log.Infof("pkg pod; PDM TLS pubkey cached for Type-4 verification")
+	}
 	p.state.EapAkaSeq = 1
 	p.state.Save()
 
@@ -234,11 +353,43 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		// Lock mutex before we start using/modifying state
 		p.mtx.Lock()
 
+		// Type-4 (ENCRYPTED_SIGNED): verify the controller's ECDSA
+		// signature over [16-byte header || ciphertext-with-tag] before
+		// decrypting. Soft-fail with a warning so transcript-layout drift
+		// doesn't block activation while we iterate.
+		if msg.Type == message.MessageTypeEncryptedSigned {
+			if len(p.state.PDMPublicKey) != 64 {
+				log.Warnf("pkg pod; received Type-4 command but no cached PDM pubkey; skipping signature check")
+			} else if len(msg.Signature) != 64 {
+				log.Warnf("pkg pod; Type-4 message has malformed signature length %d", len(msg.Signature))
+			} else {
+				ok, vErr := pair.VerifyType4Signature(p.state.PDMPublicKey, msg.Raw[:16], msg.Payload, msg.Signature)
+				if vErr != nil {
+					log.Warnf("pkg pod; Type-4 signature verify error: %s", vErr)
+				} else if !ok {
+					log.Warnf("pkg pod; Type-4 signature verification FAILED (continuing)")
+				} else {
+					log.Infof("pkg pod; Type-4 signature verified")
+				}
+			}
+		}
+
 		decrypted, err := encrypt.DecryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, msg)
 		if err != nil {
 			log.Fatalf("pkg pod; could not decrypt message: %s", err)
 		}
 		p.state.NonceSeq++
+
+		// O5 AID setup commands (UTC, TDI, BG profile, DIA, EGV, history,
+		// pod status) arrive in this same encrypted stream but use a plain
+		// ASCII key=value protocol instead of SLPE-wrapped Omnipod commands.
+		// They run between AssignAddress and SetupPod during pairing.
+		if aid.IsAIDPayload(decrypted.Payload) {
+			p.handleAIDCommand(msg, decrypted.Payload)
+			p.mtx.Unlock()
+			p.notifyStateChange()
+			continue
+		}
 
 		cmd, err := command.Unmarshal(decrypted.Payload)
 		if err != nil {
@@ -267,7 +418,14 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 
 		var rsp response.Response
 		if cmd.IsResponseHardcoded() {
-			rsp, err = cmd.GetResponse()
+			// Prefer the mode-aware variant when the command implements
+			// it (currently SetUniqueID and GetVersion). Other commands
+			// keep the original single-byte-stream GetResponse path.
+			if mr, ok := cmd.(command.ResponseForMode); ok {
+				rsp, err = mr.GetResponseForMode(p.state.Mode)
+			} else {
+				rsp, err = cmd.GetResponse()
+			}
 			if err != nil {
 				log.Fatalf("pkg pod; could not get command response: %s", err)
 			}

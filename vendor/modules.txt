@@ -24,6 +24,7 @@ github.com/jacobsa/crypto/common
 # github.com/jacobsa/reqtrace v0.0.0-20150505043853-245c9e0234cb
 ## explicit
 # github.com/konsorten/go-windows-terminal-sequences v1.0.3
+## explicit
 github.com/konsorten/go-windows-terminal-sequences
 # github.com/niemeyer/pretty v0.0.0-20200227124842-a10e7caefd8e
 ## explicit
@@ -41,6 +42,7 @@ github.com/paypal/gatt/xpc
 ## explicit
 github.com/pelletier/go-toml
 # github.com/pkg/errors v0.9.1
+## explicit
 github.com/pkg/errors
 # github.com/pschlump/AesCCM v0.0.0-20160925022350-c5df73b5834e
 ## explicit

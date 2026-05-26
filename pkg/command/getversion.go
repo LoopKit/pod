@@ -3,6 +3,7 @@ package command
 import (
 	"fmt"
 
+	"github.com/avereha/pod/pkg/pair"
 	"github.com/avereha/pod/pkg/response"
 	log "github.com/sirupsen/logrus"
 )
@@ -39,6 +40,13 @@ func (g *GetVersion) DoesMutatePodState() bool {
 func (g *GetVersion) GetResponse() (response.Response, error) {
 	// TODO improve responses
 	return &response.VersionResponse{}, nil
+}
+
+// GetResponseForMode returns the GetVersion response stamped with the active
+// pairing mode so the response layer can pick the right byte stream. Until
+// Joe's O5 captures land, both modes yield the same bytes.
+func (g *GetVersion) GetResponseForMode(mode pair.Mode) (response.Response, error) {
+	return &response.VersionResponse{Mode: mode}, nil
 }
 
 func (g *GetVersion) SetHeaderData(seq uint8, id []byte) error {

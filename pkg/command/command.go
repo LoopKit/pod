@@ -3,6 +3,7 @@ package command
 import (
 	"fmt"
 
+	"github.com/avereha/pod/pkg/pair"
 	"github.com/avereha/pod/pkg/response"
 
 	log "github.com/sirupsen/logrus"
@@ -56,6 +57,13 @@ type Command interface {
 	GetPayload() Payload
 	GetType() Type
 	GetSeq() uint8
+}
+
+// ResponseForMode is an optional interface a Command may implement when it
+// returns different response bytes depending on the pairing mode (Dash vs O5).
+// Commands that don't implement this fall back to GetResponse().
+type ResponseForMode interface {
+	GetResponseForMode(mode pair.Mode) (response.Response, error)
 }
 
 type CommandReader struct {

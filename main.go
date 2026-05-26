@@ -6,6 +6,7 @@ import (
 
 	"github.com/avereha/pod/pkg/api"
 	"github.com/avereha/pod/pkg/bluetooth"
+	"github.com/avereha/pod/pkg/pair"
 	"github.com/avereha/pod/pkg/pod"
 
 	"github.com/sirupsen/logrus"
@@ -15,11 +16,17 @@ import (
 func main() {
 	var stateFile = flag.String("state", "state.toml", "pod state")
 	var freshState = flag.Bool("fresh", false, "start fresh. not activated, empty state")
+	var modeFlag = flag.String("mode", "dash", "pairing mode: dash or o5")
 	// if both verbose and quiet are chosen, e.g., -v -q, the verbose dominates
 	var traceLevel = flag.Bool("v", false, "verbose off by default, TraceLevel")
 	var infoLevel = flag.Bool("q", false, "quiet off by default, InfoLevel")
 
 	flag.Parse()
+
+	pairMode, err := pair.ParseMode(*modeFlag)
+	if err != nil {
+		log.Fatalf("%v", err)
+	}
 
 	if *traceLevel {
 		log.SetLevel(log.TraceLevel)
@@ -39,7 +46,6 @@ func main() {
 	state := &pod.PODState{
 		Filename: *stateFile,
 	}
-	var err error
 	if !(*freshState) {
 		state, err = pod.NewState(*stateFile)
 		if err != nil {
@@ -49,13 +55,25 @@ func main() {
 
 	log.Tracef("podId %x", state.Id)
 
-	ble, err := bluetooth.New("hci0", state.Id)
+	// Reconcile the CLI -mode flag against any persisted mode so a
+	// restart without -mode doesn't silently rewrite an O5 state to
+	// Dash (the flag's default). On a fresh start the flag wins; on a
+	// restart the persisted value wins and we warn on mismatch.
+	resolvedMode, modeConflict := pod.ResolveMode(state, pairMode, *freshState)
+	if modeConflict {
+		log.Warnf("persisted mode %q differs from -mode flag %q; using persisted value (pass -fresh to override)",
+			state.Mode, pairMode)
+	}
+	pairMode = resolvedMode
+
+	ble, err := bluetooth.New("hci0", state.Id, pairMode)
 	//defer ble.Close()
 	if err != nil {
 		log.Fatalf("Could not start BLE: %s", err)
 	}
 
-	p := pod.New(ble, *stateFile, *freshState)
+	log.Infof("pairing mode: %s", pairMode)
+	p := pod.New(ble, *stateFile, *freshState, pairMode)
 	go func() {
 		p.StartAcceptingCommands()
 	}()

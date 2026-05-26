@@ -1,6 +1,7 @@
 package command
 
 import (
+	"github.com/avereha/pod/pkg/pair"
 	"github.com/avereha/pod/pkg/response"
 	log "github.com/sirupsen/logrus"
 )
@@ -35,6 +36,13 @@ func (g *SetUniqueID) DoesMutatePodState() bool {
 func (g *SetUniqueID) GetResponse() (response.Response, error) {
 	// TODO improve responses
 	return &response.SetUniqueID{}, nil
+}
+
+// GetResponseForMode returns the SetUniqueID response stamped with the active
+// pairing mode so the response layer can pick the right byte stream. Until
+// Joe's O5 captures land, both modes yield the same bytes.
+func (g *SetUniqueID) GetResponseForMode(mode pair.Mode) (response.Response, error) {
+	return &response.SetUniqueID{Mode: mode}, nil
 }
 
 func (g *SetUniqueID) SetHeaderData(seq uint8, id []byte) error {
