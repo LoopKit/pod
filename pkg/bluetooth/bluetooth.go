@@ -37,9 +37,16 @@ type Ble struct {
 	messageInput  chan *message.Message
 	messageOutput chan *message.Message
 
-	stopLoop chan bool
-	device   *gatt.Device
-	central  *gatt.Central
+	stopLoop    chan bool
+	reconnected chan bool
+	device      *gatt.Device
+	central     *gatt.Central
+
+	// connGen counts central connections; servingGen is the one the
+	// message loop was started for. They differ only after a real reconnect.
+	genMtx     sync.Mutex
+	connGen    uint64
+	servingGen uint64
 
 	cmdNotifier    gatt.Notifier
 	cmdNotifierMtx sync.Mutex
@@ -71,6 +78,7 @@ func New(adapterID string, podId []byte) (*Ble, error) {
 		cmdOutput:     make(chan Packet, 5),
 		messageInput:  make(chan *message.Message, 5),
 		messageOutput: make(chan *message.Message, 2),
+		reconnected:   make(chan bool, 1),
 		device:        &d,
 	}
 
@@ -79,6 +87,15 @@ func New(adapterID string, podId []byte) (*Ble, error) {
 			fmt.Println("pkg bluetooth; ** New connection from: ", c.ID())
 			b.StopMessageLoop()
 			b.central = &c
+			b.genMtx.Lock()
+			b.connGen++
+			b.genMtx.Unlock()
+			// Wake any in-flight CommandLoop so it can tear down and
+			// re-establish a session on this new connection.
+			select {
+			case b.reconnected <- true:
+			default:
+			}
 		}),
 		gatt.CentralDisconnected(func(c gatt.Central) {
 			log.Tracef("pkg bluetooth; ** disconnect: %s", c.ID())
@@ -273,14 +290,32 @@ func (b *Ble) ReadMessage() (*message.Message, error) {
 	return message, nil
 }
 
-func (b *Ble) ReadMessageWithTimeout(d time.Duration) (*message.Message, bool) {
-	select {
-	case message := <-b.messageInput:
-		return message, false
-	case <-time.After(d):
-		log.Debugf("ReadMessage timeout")
-		return nil, true
+func (b *Ble) ReadMessageWithTimeout(d time.Duration) (*message.Message, bool, bool) {
+	deadline := time.After(d)
+	for {
+		select {
+		case message := <-b.messageInput:
+			return message, false, false
+		case <-b.reconnected:
+			if b.servingCurrentConnection() {
+				// Latched while this very connection was being set up
+				// (pairing retries connect several times). Not a reconnect.
+				log.Tracef("pkg bluetooth; ignoring stale connect signal")
+				continue
+			}
+			log.Debugf("ReadMessage interrupted by a new connection")
+			return nil, false, true
+		case <-deadline:
+			log.Debugf("ReadMessage timeout")
+			return nil, true, false
+		}
 	}
+}
+
+func (b *Ble) servingCurrentConnection() bool {
+	b.genMtx.Lock()
+	defer b.genMtx.Unlock()
+	return b.connGen == b.servingGen
 }
 
 func (b *Ble) ShutdownConnection() {
@@ -311,6 +346,13 @@ func (b *Ble) loop(stop chan bool) {
 func (b *Ble) StartMessageLoop() {
 	if b.stopLoop != nil {
 		log.Fatalf("pkg bluetooth; Messaging loop is already running")
+	}
+	b.genMtx.Lock()
+	b.servingGen = b.connGen
+	b.genMtx.Unlock()
+	select {
+	case <-b.reconnected:
+	default:
 	}
 	b.stopLoop = make(chan bool)
 	go b.loop(b.stopLoop)
