@@ -214,7 +214,18 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 			log.Exit(0)
 		}
 		log.Infof("pkg pod;   *** Waiting for the next command ***")
-		msg, didTimeout := p.ble.ReadMessageWithTimeout(3 * time.Minute)
+		msg, didTimeout, didReconnect := p.ble.ReadMessageWithTimeout(3 * time.Minute)
+		if didReconnect {
+			// The phone dropped the link and came back. The message loop was
+			// stopped by the CentralConnected handler, so hand off to a fresh
+			// StartAcceptingCommands, which restarts it and renegotiates the
+			// EAP-AKA session over the new connection.
+			log.Infof("pkg pod; new connection — re-establishing session")
+			go func() {
+				p.StartAcceptingCommands()
+			}()
+			return
+		}
 		if didTimeout {
 			p.ble.ShutdownConnection()
 			go func() {
