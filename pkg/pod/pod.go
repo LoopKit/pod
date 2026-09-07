@@ -424,6 +424,9 @@ func (p *Pod) getResponse(cmd command.Command) response.Response {
 	var rsp response.Response
 
 	getStatus, isStatusRequest := cmd.(*command.GetStatus)
+	if p.state.MinutesActive() >= 80 * 60 && p.state.FaultEvent == 0 {
+		p.state.FaultEvent = 0x1C // 0x1C = exceeded maximum pod life of 80 hours
+	}
 	if !isStatusRequest || getStatus.RequestType == 0 || getStatus.RequestType == 7 {
 		// Not a get status command or a type 0 or type 7 get status
 		if p.state.FaultEvent == 0 {
