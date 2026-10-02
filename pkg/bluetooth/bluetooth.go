@@ -90,6 +90,7 @@ func New(adapterID string, podId []byte) (*Ble, error) {
 			b.genMtx.Lock()
 			b.connGen++
 			b.genMtx.Unlock()
+			b.drainInputs()
 			// Wake any in-flight CommandLoop so it can tear down and
 			// re-establish a session on this new connection.
 			select {
@@ -308,6 +309,21 @@ func (b *Ble) ReadMessageWithTimeout(d time.Duration) (*message.Message, bool, b
 		case <-deadline:
 			log.Debugf("ReadMessage timeout")
 			return nil, true, false
+		}
+	}
+}
+
+// drainInputs discards packets and messages still queued from a previous
+// connection, so the session negotiated on a new connection can't consume
+// them (e.g. a stale encrypted command read as the EAP-AKA Success).
+func (b *Ble) drainInputs() {
+	for {
+		select {
+		case <-b.cmdInput:
+		case <-b.dataInput:
+		case <-b.messageInput:
+		default:
+			return
 		}
 	}
 }
