@@ -247,7 +247,9 @@ func (b *Ble) loop(stop chan bool) {
 		case cmd := <-b.cmdInput:
 			msg, err := b.readMessage(cmd)
 			if err != nil {
-				log.Fatalf("pkg bluetooth; error reading message: %s", err)
+				// The phone was told it failed and sends it again.
+				log.Errorf("pkg bluetooth; error reading message: %s", err)
+				continue
 			}
 			b.messageInput <- msg
 		}
