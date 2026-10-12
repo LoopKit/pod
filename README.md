@@ -102,6 +102,11 @@ impossible-mux /tmp/impossible-g7.sock /tmp/impossible-pod.sock
 The pod holds a connect that asks for a start delay (`CBConnectPeripheralOptionStartDelayKey`) for that delay, as iOS
 does, and hangs up after 3 minutes without a command, as above.
 
+Its advertisement shows a fault or a firing alert, as a real pod's does: the 2nd service UUID becomes `C00A` on a fault
+(`C005` for an alert), and the manufacturer data carries the fault code and alert slots. A fault set from the control
+panel reaches a backgrounded Loop the way a real one does, through its scan for `C00A`; with `impossible-mux -suspend`
+the advertisement wakes the suspended app.
+
 # Original README.md
 
 We maintained the original README file below. It may be helpful if someone plans to cross-compile the code and just transfer the executable.

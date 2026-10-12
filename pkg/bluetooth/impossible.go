@@ -31,6 +31,7 @@ type simRadio struct {
 	scanning  bool
 	connected bool
 	podId     []byte
+	state     AdvertState
 	notifying map[string]bool // characteristic ids
 	delayed   *time.Timer     // a connect held for its start delay
 }
@@ -283,20 +284,21 @@ func (r *simRadio) handle(c *simClient, msg map[string]interface{}) {
 // advertising, which it does whenever it has no connection.
 func (r *simRadio) discovered() {
 	r.mu.Lock()
-	c, scanning, connected, podId := r.client, r.scanning, r.connected, r.podId
+	c, scanning, connected, podId, state := r.client, r.scanning, r.connected, r.podId, r.state
 	r.mu.Unlock()
 	if c == nil || !scanning || connected {
 		return
 	}
 	var uuids []string
-	for _, u := range AdvertisedServices(podId) {
+	for _, u := range AdvertisedServices(podId, state) {
 		uuids = append(uuids, fmt.Sprintf("%04X", u))
 	}
 	c.send(map[string]interface{}{"type": "didDiscover", "id": r.id, "name": AdvertisedName, "rssi": -60,
 		"adv": map[string]interface{}{
-			"kCBAdvDataLocalName":     AdvertisedName,
-			"kCBAdvDataIsConnectable": true,
-			"kCBAdvDataServiceUUIDs":  uuids,
+			"kCBAdvDataLocalName":        AdvertisedName,
+			"kCBAdvDataIsConnectable":    true,
+			"kCBAdvDataServiceUUIDs":     uuids,
+			"kCBAdvDataManufacturerData": base64.StdEncoding.EncodeToString(state.ManufacturerData()),
 		}})
 }
 
@@ -382,6 +384,17 @@ func (r *simRadio) Advertise(podId []byte) error {
 	r.podId = podId
 	r.mu.Unlock()
 	r.discovered()
+	return nil
+}
+
+func (r *simRadio) AdvertiseState(state AdvertState) error {
+	r.mu.Lock()
+	changed := r.state != state
+	r.state = state
+	r.mu.Unlock()
+	if changed {
+		r.discovered()
+	}
 	return nil
 }
 

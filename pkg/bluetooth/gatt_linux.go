@@ -15,6 +15,10 @@ type gattRadio struct {
 	device  gatt.Device
 	central gatt.Central
 
+	advertMtx sync.Mutex
+	podId     []byte
+	state     AdvertState
+
 	cmdNotifier    gatt.Notifier
 	cmdNotifierMtx sync.Mutex
 
@@ -38,7 +42,7 @@ func NewGattRadio(b *Ble, podId []byte) (Radio, error) {
 	if err != nil {
 		log.Fatalf("pkg bluetooth; failed to open device, err: %s", err)
 	}
-	r := &gattRadio{device: d}
+	r := &gattRadio{device: d, podId: podId}
 
 	d.Handle(
 		gatt.CentralConnected(func(c gatt.Central) {
@@ -101,7 +105,7 @@ func NewGattRadio(b *Ble, podId []byte) (Radio, error) {
 				log.Fatalf("pkg bluetooth; could not add service: %s", err)
 			}
 
-			if err := r.advertise(podId); err != nil {
+			if err := r.advertise(); err != nil {
 				log.Fatalf("pkg bluetooth; could not advertise: %s", err)
 			}
 		default:
@@ -114,9 +118,13 @@ func NewGattRadio(b *Ble, podId []byte) (Radio, error) {
 	return r, nil
 }
 
-func (r *gattRadio) advertise(podId []byte) error {
+func (r *gattRadio) advertise() error {
+	r.advertMtx.Lock()
+	podId, state := r.podId, r.state
+	r.advertMtx.Unlock()
+	// paypal/gatt advertises no manufacturer data.
 	var uuids []gatt.UUID
-	for _, u := range AdvertisedServices(podId) {
+	for _, u := range AdvertisedServices(podId, state) {
 		uuids = append(uuids, gatt.UUID16(u))
 	}
 	return r.device.AdvertiseNameAndServices(AdvertisedName, uuids)
@@ -124,7 +132,25 @@ func (r *gattRadio) advertise(podId []byte) error {
 
 // Advertise updates the advertisement; paypal/gatt needs no StopAdvertising first.
 func (r *gattRadio) Advertise(podId []byte) error {
-	err := r.advertise(podId)
+	r.advertMtx.Lock()
+	r.podId = podId
+	r.advertMtx.Unlock()
+	err := r.advertise()
+	if err != nil {
+		log.Infof("pkg bluetooth; could not re-advertise: %s", err)
+	}
+	return err
+}
+
+func (r *gattRadio) AdvertiseState(state AdvertState) error {
+	r.advertMtx.Lock()
+	changed := r.state != state
+	r.state = state
+	r.advertMtx.Unlock()
+	if !changed {
+		return nil
+	}
+	err := r.advertise()
 	if err != nil {
 		log.Infof("pkg bluetooth; could not re-advertise: %s", err)
 	}

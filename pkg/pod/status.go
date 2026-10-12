@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/avereha/pod/pkg/bluetooth"
 	"github.com/avereha/pod/pkg/response"
 )
 
@@ -55,6 +56,7 @@ func (p *Pod) takeSnapshot() {
 	p.snapMtx.Lock()
 	p.snapshot = *p.state
 	p.snapMtx.Unlock()
+	p.ble.SetAdvertisedState(bluetooth.AdvertState{Fault: p.state.FaultEvent, Alerts: p.state.ActiveAlertSlots})
 }
 
 // Status reports the pod as of its last completed command or change.

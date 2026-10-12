@@ -2,6 +2,7 @@ package bluetooth
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"io/ioutil"
@@ -65,7 +66,7 @@ func TestSimRadioPairsAndCarriesBothCharacteristics(t *testing.T) {
 	app.send(map[string]interface{}{"type": "scan"})
 	adv := app.expect("didDiscover")["adv"].(map[string]interface{})
 	uuids := adv["kCBAdvDataServiceUUIDs"].([]interface{})
-	if len(uuids) != 9 || uuids[0] != "4024" || uuids[2] != "000A" || uuids[3] != "FFFF" || uuids[4] != "FFFE" {
+	if len(uuids) != 9 || uuids[0] != "4024" || uuids[1] != "2470" || uuids[2] != "000A" || uuids[3] != "FFFF" || uuids[4] != "FFFE" {
 		t.Fatalf("an unpaired pod advertises %v", uuids)
 	}
 
@@ -124,8 +125,17 @@ func TestSimRadioPairsAndCarriesBothCharacteristics(t *testing.T) {
 		t.Fatal("still connected")
 	}
 	uuids = app.expect("didDiscover")["adv"].(map[string]interface{})["kCBAdvDataServiceUUIDs"].([]interface{})
-	if uuids[3] != "170D" || uuids[4] != "2A40" {
+	if uuids[1] != "C001" || uuids[3] != "170D" || uuids[4] != "2A40" {
 		t.Fatalf("a paired pod advertises %v", uuids)
+	}
+
+	// A fault changes the advertisement, which wakes a suspended app.
+	b.SetAdvertisedState(AdvertState{Fault: 0x14})
+	adv = app.expect("didDiscover")["adv"].(map[string]interface{})
+	uuids = adv["kCBAdvDataServiceUUIDs"].([]interface{})
+	mfg, _ := base64.StdEncoding.DecodeString(adv["kCBAdvDataManufacturerData"].(string))
+	if uuids[1] != "C00A" || len(mfg) < 8 || !bytes.Equal(mfg[len(mfg)-7:len(mfg)-3], []byte{0x00, 0x14, 0x14, 0x00}) {
+		t.Fatalf("a pod with an occlusion advertises %v, %x", uuids, mfg)
 	}
 }
 
