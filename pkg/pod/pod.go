@@ -2,6 +2,7 @@ package pod
 
 import (
 	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 
@@ -109,6 +110,14 @@ func (p *Pod) readSetup() (*message.Message, bool) {
 	}
 }
 
+// startOver hangs up on a phone whose message the pod can't use. The phone
+// reconnects and sets up a new session.
+func (p *Pod) startOver(format string, args ...interface{}) {
+	log.Errorf("pkg pod; "+format+"; hanging up", args...)
+	p.ble.ShutdownConnection()
+	go p.StartAcceptingCommands()
+}
+
 func (p *Pod) StartActivation() {
 
 	pair := &pair.Pair{}
@@ -117,14 +126,16 @@ func (p *Pod) StartActivation() {
 		return
 	}
 	if err := pair.ParseSP1SP2(msg); err != nil {
-		log.Fatalf("pkg pod; error parsing SP1SP2 %s", err)
+		p.startOver("error parsing SP1SP2 %s", err)
+		return
 	}
 	// read PDM public key and nonce
 	if msg, ok = p.readSetup(); !ok {
 		return
 	}
 	if err := pair.ParseSPS1(msg); err != nil {
-		log.Fatalf("pkg pod; error parsing SPS1 %s", err)
+		p.startOver("error parsing SPS1 %s", err)
+		return
 	}
 
 	msg, err := pair.GenerateSPS1()
@@ -138,7 +149,10 @@ func (p *Pod) StartActivation() {
 	if msg, ok = p.readSetup(); !ok {
 		return
 	}
-	pair.ParseSPS2(msg)
+	if err := pair.ParseSPS2(msg); err != nil {
+		p.startOver("error parsing SPS2 %s", err)
+		return
+	}
 
 	// send POD conf value
 	msg, err = pair.GenerateSPS2()
@@ -153,7 +167,8 @@ func (p *Pod) StartActivation() {
 	}
 	err = pair.ParseSP0GP0(msg)
 	if err != nil {
-		log.Fatalf("pkg pod; could not parse SP0GP0: %s", err)
+		p.startOver("could not parse SP0GP0: %s", err)
+		return
 	}
 
 	// send P0 constant
@@ -184,7 +199,8 @@ func (p *Pod) EapAka() {
 	}
 	err := session.ParseChallenge(msg)
 	if err != nil {
-		log.Fatalf("pkg pod; error parsing the EAP-AKA challenge: %s", err)
+		p.startOver("error parsing the EAP-AKA challenge: %s", err)
+		return
 	}
 
 	msg, err = session.GenerateChallengeResponse()
@@ -199,7 +215,8 @@ func (p *Pod) EapAka() {
 	log.Debugf("pkg pod; success? %x", msg.Payload) // TODO: figure out how error looks like
 	err = session.ParseSuccess(msg)
 	if err != nil {
-		log.Fatalf("pkg pod; error parsing the EAP-AKA Success packet: %s", err)
+		p.startOver("error parsing the EAP-AKA Success packet: %s", err)
+		return
 	}
 	p.state.CK, p.state.NoncePrefix = session.CKNoncePrefix()
 
@@ -272,17 +289,28 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 
 		decrypted, err := encrypt.DecryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, msg)
 		if err != nil {
-			log.Fatalf("pkg pod; could not decrypt message: %s", err)
+			p.mtx.Unlock()
+			p.startOver("could not decrypt message: %s", err)
+			return
 		}
 		p.state.NonceSeq++
 
+		if len(decrypted.Payload) < 16 {
+			p.mtx.Unlock()
+			p.startOver("decrypted payload too short: %x", decrypted.Payload)
+			return
+		}
 		cmd, err := command.Unmarshal(decrypted.Payload)
 		if err != nil {
-			log.Fatalf("pkg pod; could not unmarshal command: %s", err)
+			p.mtx.Unlock()
+			p.startOver("could not unmarshal command: %s", err)
+			return
 		}
 		cmdSeq, requestID, err := cmd.GetHeaderData()
 		if err != nil {
-			log.Fatalf("pkg pod; could not get command header data: %s", err)
+			p.mtx.Unlock()
+			p.startOver("could not get command header data: %s", err)
+			return
 		}
 		p.state.CmdSeq = cmdSeq
 
@@ -290,9 +318,6 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		data = decrypted.Payload
 		n = len(data)
 		log.Debugf("pkg pod; len = %d", n)
-		if n < 16 {
-			log.Fatalf("pkg pod; decrypted. Payload too short")
-		}
 		pMsg.MsgBodyCommand = data[13 : n-5]
 		if data[13] == 0x1c {
 			pMsg.DeactivateFlag = true
@@ -370,16 +395,19 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		}
 		// TODO check for SEQ numbers here and the Ack flag
 		decrypted, err = encrypt.DecryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, msg)
-		if err != nil {
-			log.Fatalf("pkg pod; could not decrypt message: %s", err)
-		}
-		p.state.NonceSeq++
-		if len(decrypted.Payload) != 0 {
-			log.Fatalf("pkg pod; this should be empty message with ACK header %s", spew.Sdump(msg))
+		if err == nil {
+			p.state.NonceSeq++
+			if len(decrypted.Payload) != 0 {
+				err = fmt.Errorf("not an empty ACK: %s", spew.Sdump(msg))
+			}
 		}
 		p.state.Save()
 		p.takeSnapshot()
 		p.mtx.Unlock()
+		if err != nil {
+			p.startOver("could not read the response ACK: %s", err)
+			return
+		}
 
 		log.Debugf("notifyingStateChange")
 		p.notifyStateChange()

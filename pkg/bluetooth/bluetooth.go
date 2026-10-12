@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"sync"
 	"time"
@@ -323,8 +324,11 @@ func (b *Ble) loop(stop chan bool, in *input) {
 		case <-stop:
 			return
 		case msg := <-b.messageOutput:
-			if err := b.writeMessage(msg, in, stop); err != nil {
+			if err := b.writeMessage(msg, in, stop); err == errStopped {
 				return
+			} else if err != nil {
+				// The phone gets no answer and asks again.
+				log.Errorf("pkg bluetooth; error writing message: %s", err)
 			}
 		case cmd := <-in.cmd:
 			msg, err := b.readMessage(cmd, in, stop)
@@ -373,8 +377,8 @@ func (b *Ble) expectCommand(expected Packet, in *input, stop chan bool) error {
 	if err != nil {
 		return err
 	}
-	if !bytes.Equal(expected[:1], cmd[:1]) {
-		log.Fatalf("pkg bluetooth; expected command: %s. received command: %s", expected, cmd)
+	if len(cmd) == 0 || cmd[0] != expected[0] {
+		return fmt.Errorf("expected command: %x. received command: %x", expected, cmd)
 	}
 	return nil
 }
@@ -467,8 +471,8 @@ func (b *Ble) readMessage(cmd Packet, in *input, stop chan bool) (*message.Messa
 	var checksum []byte
 
 	log.Trace("pkg bluetooth; Reading RTS")
-	if !bytes.Equal(CmdRTS[:1], cmd[:1]) {
-		log.Fatalf("pkg bluetooth; expected command: %x. received command: %x", CmdRTS, cmd)
+	if len(cmd) == 0 || cmd[0] != CmdRTS[0] {
+		return nil, fmt.Errorf("expected command: %x. received command: %x", CmdRTS, cmd)
 	}
 	log.Trace("pkg bluetooth; Sending CTS")
 
