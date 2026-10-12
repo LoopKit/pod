@@ -31,22 +31,57 @@ type Radio interface {
 	NotifyCmd(Packet) error
 	NotifyData(Packet) error
 	Advertise(podId []byte) error
+	AdvertiseState(state AdvertState) error
 	Disconnect()
 }
 
 const AdvertisedName = " :: Fake POD ::"
 
+// AdvertState is what a paired pod advertises of its state: its fault
+// code and its firing alert slots, 0 when there are none.
+type AdvertState struct {
+	Fault  uint8
+	Alerts uint8
+}
+
+// status is the 2nd service UUID: real pods go C001 → C005 when an alert
+// fires → C00A on a fault (captured in OmnipodKit). A fault is a new
+// advertisement, which wakes a suspended app scanning for it.
+func (s AdvertState) status() uint16 {
+	switch {
+	case s.Fault != 0:
+		return 0xC00A
+	case s.Alerts != 0:
+		return 0xC005
+	}
+	return 0xC001
+}
+
+// ManufacturerData is the pod's iBeacon-shaped manufacturer data, with the
+// status word OmnipodKit decodes 7 bytes from its end: 00, 02 (or the fault
+// code), the fault code, the alert slots. A captured occlusion read 00141400.
+func (s AdvertState) ManufacturerData() []byte {
+	b1 := uint8(0x02)
+	if s.Fault != 0 {
+		b1 = s.Fault
+	}
+	data := []byte{0x4c, 0x00, 0x02, 0x15}
+	data = append(data, make([]byte, 14)...)
+	return append(data, 0x00, b1, s.Fault, s.Alerts, 0x00, 0x00, 0xc5)
+}
+
 // AdvertisedServices is the list of 16-bit service UUIDs a DASH pod
 // advertises; the 4th and 5th carry its id, FFFF FFFE before pairing.
-func AdvertisedServices(podId []byte) []uint16 {
-	idOne, idTwo := uint16(0xffff), uint16(0xfffe)
+func AdvertisedServices(podId []byte, state AdvertState) []uint16 {
+	idOne, idTwo, second := uint16(0xffff), uint16(0xfffe), uint16(0x2470)
 	if podId != nil {
 		idOne = binary.BigEndian.Uint16(podId[0:2])
 		idTwo = binary.BigEndian.Uint16(podId[2:4])
+		second = state.status()
 	}
 	return []uint16{
 		0x4024,
-		0x2470,
+		second,
 		0x000a,
 		idOne,
 		idTwo,
@@ -162,6 +197,11 @@ func (b *Ble) DataWritten(data []byte) {
 func (b *Ble) RefreshAdvertisingWithSpecifiedId(id []byte) error { // 4 bytes, first 2 usually empty
 	log.Debugf("RefreshAdvertisingWithSpecifiedId %x", id)
 	return b.radio.Advertise(id)
+}
+
+// SetAdvertisedState advertises the pod's fault and firing alerts.
+func (b *Ble) SetAdvertisedState(state AdvertState) error {
+	return b.radio.AdvertiseState(state)
 }
 
 func (b *Ble) WriteCmd(packet Packet) error {
