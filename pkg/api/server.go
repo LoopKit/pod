@@ -2,8 +2,11 @@ package api
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/ioutil"
 	"net/http"
+	"strings"
 
 	"github.com/avereha/pod/pkg/pod"
 	"github.com/gorilla/websocket"
@@ -26,18 +29,23 @@ func New(pod *pod.Pod) *Server {
 	return ret
 }
 
-func (s *Server) Start() {
-	fmt.Println("Pod simulator web api listening on :8080")
+func (s *Server) Start(addr string) {
 	s.setupRoutes()
-	fmt.Println("Setting Web Message Hook")
 	s.pod.SetWebMessageHook(func(msg []byte) {
 		s.sendMessage(msg)
 	})
-	http.ListenAndServe(":8080", nil)
+	log.Infof("Pod simulator control panel on http://%s/", displayAddr(addr))
+	log.Fatal(http.ListenAndServe(addr, nil))
+}
+
+func displayAddr(addr string) string {
+	if strings.HasPrefix(addr, ":") {
+		return "localhost" + addr
+	}
+	return addr
 }
 
 func (s *Server) sendMessage(msg []byte) {
-	fmt.Println("writing to websocket")
 	if s.conn != nil {
 		if err := s.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
 			log.Println(err)
@@ -48,19 +56,48 @@ func (s *Server) sendMessage(msg []byte) {
 
 func (s *Server) setupRoutes() {
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "This is an API to the pod simulator intended to be used with a separate web client.")
+		if r.URL.Path != "/" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		fmt.Fprint(w, indexHTML)
 	})
+	http.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, s.pod.Status())
+	})
+	http.HandleFunc("/command", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST a command", http.StatusMethodNotAllowed)
+			return
+		}
+		body, err := ioutil.ReadAll(r.Body)
+		if err == nil {
+			err = s.handleCommand(body)
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		writeJSON(w, s.pod.Status())
+	})
+	// The websocket API, for github.com/ps2/pod_simulator_frontend.
 	http.Handle("/ws", s)
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	fmt.Println(r.Host)
+func writeJSON(w http.ResponseWriter, v interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	json.NewEncoder(w).Encode(v)
+}
 
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// upgrade this connection to a WebSocket
 	// connection
 	ws, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		log.Println(err)
+		return
 	}
 
 	s.conn = ws
@@ -87,56 +124,65 @@ func (s *Server) reader(conn *websocket.Conn) {
 			log.Println(err)
 			return
 		}
-		fmt.Println("Received: " + string(p))
-		s.handleCommand(p)
+		log.Debugf("Received: %s", p)
+		if err := s.handleCommand(p); err != nil {
+			log.Error(err)
+		}
 	}
 }
 
-func (s *Server) handleCommand(bytes []byte) {
+func (s *Server) handleCommand(bytes []byte) error {
 	var msg map[string]interface{}
 	if err := json.Unmarshal(bytes, &msg); err != nil {
-		log.Error(err)
-		return
+		return err
 	}
 
-	var (
-		command string
-		value   float64
-		ok      bool
-	)
-
-	if command, ok = msg["command"].(string); !ok {
-		log.Fatal("command is not a string or not in msg")
+	command, ok := msg["command"].(string)
+	if !ok {
+		return errors.New("command is not a string or not in msg")
+	}
+	value, hasValue := msg["value"].(float64)
+	needValue := func(what string, min, max float64) error {
+		if !hasValue {
+			return fmt.Errorf("%s is not a number or not in msg", what)
+		}
+		if value < min || value > max {
+			return fmt.Errorf("%s %v: want %v to %v", what, value, min, max)
+		}
+		return nil
 	}
 
 	switch command {
 	case "changeReservoir":
-		if value, ok = msg["value"].(float64); !ok {
-			log.Fatal("reservoir value is not a number or not in msg")
+		if err := needValue("reservoir", 0, 200); err != nil {
+			return err
 		}
 		s.pod.SetReservoir(float32(value))
 	case "setAlerts":
-		if value, ok = msg["value"].(float64); !ok {
-			log.Fatal("alert value is not a number or not in msg")
+		if err := needValue("alert mask", 0, 255); err != nil {
+			return err
 		}
 		s.pod.SetAlerts(uint8(value))
 	case "setFault":
-		if value, ok = msg["value"].(float64); !ok {
-			log.Fatal("fault value is not a number or not in msg")
+		if err := needValue("fault", 0, 255); err != nil {
+			return err
 		}
 		s.pod.SetFault(uint8(value))
 	case "setActiveTime":
-		if value, ok = msg["value"].(float64); !ok {
-			log.Fatal("active time in minutes is not a number or not in msg")
+		if err := needValue("active time in minutes", 0, 100*60); err != nil {
+			return err
 		}
 		s.pod.SetActiveTime(int(value))
 	case "crashNextCommand":
-		var beforeProcessing bool
-		if beforeProcessing, ok = msg["beforeProcessing"].(bool); !ok {
-			log.Fatal("beforeProcessing is not a bool or not in msg")
+		beforeProcessing, ok := msg["beforeProcessing"].(bool)
+		if !ok {
+			return errors.New("beforeProcessing is not a bool or not in msg")
 		}
 		s.pod.CrashNextCommand(beforeProcessing)
+	default:
+		return fmt.Errorf("unknown command %q", command)
 	}
+	return nil
 }
 
 // We'll need to define an Upgrader

@@ -8,6 +8,7 @@ import (
 	"github.com/avereha/pod/pkg/bluetooth"
 	"github.com/avereha/pod/pkg/command"
 	"github.com/avereha/pod/pkg/eap"
+	"github.com/avereha/pod/pkg/message"
 	"github.com/avereha/pod/pkg/pair"
 
 	"github.com/avereha/pod/pkg/encrypt"
@@ -33,32 +34,23 @@ type Pod struct {
 	state          *PODState
 	mtx            sync.Mutex
 	webMessageHook func([]byte)
+
+	// snapshot is the state as of the last completed command, for the
+	// status page: mtx is held while a command waits for the phone's ACK.
+	snapMtx  sync.Mutex
+	snapshot PODState
 }
 
 // Once one of these are set, the next command will crash the executable.
 var crashBeforeProcessingCommand bool
 var crashAfterProcessingCommand bool
 
-func New(ble *bluetooth.Ble, stateFile string, freshState bool) *Pod {
-	var err error
-
-	state := &PODState{
-		Reservoir:      150 / 0.05,
-		ActivationTime: time.Now(),
-		Filename:       stateFile,
-	}
-	if !freshState {
-		state, err = NewState(stateFile)
-		if err != nil {
-			log.Fatalf("pkg pod; could not restore pod state from %s: %+v", stateFile, err)
-		}
-	}
-
+func New(ble *bluetooth.Ble, state *PODState) *Pod {
 	ret := &Pod{
 		ble:   ble,
 		state: state,
 	}
-
+	ret.snapshot = *state
 	return ret
 }
 
@@ -101,15 +93,36 @@ func (p *Pod) StartAcceptingCommands() {
 	}
 }
 
+// readSetup waits for the phone's next pairing or session message. A new
+// connection abandons the exchange: the phone starts over on it.
+func (p *Pod) readSetup() (*message.Message, bool) {
+	for {
+		msg, _, didReconnect := p.ble.ReadMessageWithTimeout(time.Minute)
+		if didReconnect {
+			log.Infof("pkg pod; new connection — starting over")
+			go p.StartAcceptingCommands()
+			return nil, false
+		}
+		if msg != nil {
+			return msg, true
+		}
+	}
+}
+
 func (p *Pod) StartActivation() {
 
 	pair := &pair.Pair{}
-	msg, _ := p.ble.ReadMessage()
+	msg, ok := p.readSetup()
+	if !ok {
+		return
+	}
 	if err := pair.ParseSP1SP2(msg); err != nil {
 		log.Fatalf("pkg pod; error parsing SP1SP2 %s", err)
 	}
 	// read PDM public key and nonce
-	msg, _ = p.ble.ReadMessage()
+	if msg, ok = p.readSetup(); !ok {
+		return
+	}
 	if err := pair.ParseSPS1(msg); err != nil {
 		log.Fatalf("pkg pod; error parsing SPS1 %s", err)
 	}
@@ -122,7 +135,9 @@ func (p *Pod) StartActivation() {
 	p.ble.WriteMessage(msg)
 
 	// read PDM conf value
-	msg, _ = p.ble.ReadMessage()
+	if msg, ok = p.readSetup(); !ok {
+		return
+	}
 	pair.ParseSPS2(msg)
 
 	// send POD conf value
@@ -133,7 +148,9 @@ func (p *Pod) StartActivation() {
 	p.ble.WriteMessage(msg)
 
 	// receive SP0GP0 constant from PDM
-	msg, _ = p.ble.ReadMessage()
+	if msg, ok = p.readSetup(); !ok {
+		return
+	}
 	err = pair.ParseSP0GP0(msg)
 	if err != nil {
 		log.Fatalf("pkg pod; could not parse SP0GP0: %s", err)
@@ -161,7 +178,10 @@ func (p *Pod) EapAka() {
 
 	session := eap.NewEapAkaChallenge(p.state.LTK, p.state.EapAkaSeq)
 
-	msg, _ := p.ble.ReadMessage()
+	msg, ok := p.readSetup()
+	if !ok {
+		return
+	}
 	err := session.ParseChallenge(msg)
 	if err != nil {
 		log.Fatalf("pkg pod; error parsing the EAP-AKA challenge: %s", err)
@@ -173,7 +193,9 @@ func (p *Pod) EapAka() {
 	}
 	p.ble.WriteMessage(msg)
 
-	msg, _ = p.ble.ReadMessage()
+	if msg, ok = p.readSetup(); !ok {
+		return
+	}
 	log.Debugf("pkg pod; success? %x", msg.Payload) // TODO: figure out how error looks like
 	err = session.ParseSuccess(msg)
 	if err != nil {
@@ -193,6 +215,9 @@ func (p *Pod) EapAka() {
 	if err != nil {
 		log.Fatalf("pkg pod; Could not save the pod state: %s", err)
 	}
+	p.mtx.Lock()
+	p.takeSnapshot()
+	p.mtx.Unlock()
 
 	// initialize pMsg
 	var pMsg PodMsgBody
@@ -330,7 +355,19 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		p.ble.WriteMessage(msg)
 
 		log.Debugf("pkg pod; reading response ACK. Nonce seq %d", p.state.NonceSeq)
-		msg, _ = p.ble.ReadMessage()
+		msg, _, didReconnect = p.ble.ReadMessageWithTimeout(3 * time.Minute)
+		if msg == nil {
+			// The phone never acknowledged; it will ask again on its next session.
+			p.state.Save()
+			p.takeSnapshot()
+			p.mtx.Unlock()
+			log.Infof("pkg pod; no response ACK — re-establishing session")
+			if !didReconnect {
+				p.ble.ShutdownConnection()
+			}
+			go p.StartAcceptingCommands()
+			return
+		}
 		// TODO check for SEQ numbers here and the Ack flag
 		decrypted, err = encrypt.DecryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, msg)
 		if err != nil {
@@ -341,6 +378,7 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 			log.Fatalf("pkg pod; this should be empty message with ACK header %s", spew.Sdump(msg))
 		}
 		p.state.Save()
+		p.takeSnapshot()
 		p.mtx.Unlock()
 
 		log.Debugf("notifyingStateChange")
@@ -582,6 +620,7 @@ func (p *Pod) SetReservoir(newVal float32) {
 	p.mtx.Lock()
 	p.state.Reservoir = uint16(newVal * 20)
 	p.state.Save()
+	p.takeSnapshot()
 	p.mtx.Unlock()
 }
 
@@ -598,6 +637,7 @@ func (p *Pod) SetAlerts(newVal uint8) {
 		}
 	}
 	p.state.Save()
+	p.takeSnapshot()
 	p.mtx.Unlock()
 }
 
@@ -606,6 +646,7 @@ func (p *Pod) SetFault(newVal uint8) {
 	p.state.FaultEvent = newVal
 	p.state.FaultTime = p.state.MinutesActive()
 	p.state.Save()
+	p.takeSnapshot()
 	p.mtx.Unlock()
 }
 
@@ -613,6 +654,7 @@ func (p *Pod) SetActiveTime(newVal int) {
 	p.mtx.Lock()
 	p.state.ActivationTime = time.Now().Add(-time.Duration(newVal) * time.Minute)
 	p.state.Save()
+	p.takeSnapshot()
 	p.mtx.Unlock()
 }
 
@@ -624,5 +666,6 @@ func (p *Pod) CrashNextCommand(beforeProcessing bool) {
 		crashAfterProcessingCommand = true
 	}
 	p.state.Save()
+	p.takeSnapshot()
 	p.mtx.Unlock()
 }

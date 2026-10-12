@@ -8,7 +8,11 @@ Fake pod implementation
 
 * This version also mimics a behavior we see in some DASH pods where the pod disconnects every 3 minutes; this can be used with iOS hooks to make a heartbeat to run Loop in situations where a BLE CGM is not available. 
 
-* It also has a websocket based API that can used by a separate [NodeJS/React frontend](https://github.com/ps2/pod_simulator_frontend), that is installed and run separately for now.
+* It serves a control panel at http://<host>:8080/ (`-api` changes the address): the pod's reservoir, delivery, age, alerts and fault, with controls to set the reservoir and pod age, raise alerts, trigger or clear a fault, and crash on the next command to test unacknowledged commands. The panel drives a JSON API: `GET /status`, and `POST /command` with `{"command": "changeReservoir", "value": 45}` (also `setActiveTime` in minutes, `setAlerts` as a slot mask, `setFault` with a fault code, 0 to clear, and `crashNextCommand` with `"beforeProcessing": true|false`).
+
+* The websocket API at `/ws`, used by the separate [NodeJS/React frontend](https://github.com/ps2/pod_simulator_frontend), is still there.
+
+* It can serve an app in the iOS Simulator instead of a phone; see [Run against the iOS Simulator](#run-against-the-ios-simulator).
 
 Requirements:
 1. Version of iOS code (Loop app) that will interact with this simulator - Loop dev branch or FreeAPS freeaps_dev branch
@@ -70,6 +74,33 @@ FATA[####] pkg bluetooth; ** disconnect:
 ```
 
 Simple restore communication as stated above.
+
+## Run against the iOS Simulator
+
+`-transport impossible` serves the pod to an app in the iOS Simulator through
+[ImpossiBLE](https://github.com/mickeyl/ImpossiBLE): no Raspberry Pi and no radio, so it runs on any Mac. The app is
+launched with ImpossiBLE's library injected, as [LoopKit/g7sim](https://github.com/LoopKit/g7sim) describes for the G7
+emulator (its `simulator/build-impossible.sh` builds the library), and talks to the pod over ImpossiBLE's socket:
+
+```
+go build
+./pod -transport impossible -fresh
+```
+
+Loop's Omnipod support (OmnipodKit) mocks pod commands in the Simulator unless it finds ImpossiBLE, and then pairs,
+primes and runs the simulated pod as it would a real one.
+
+ImpossiBLE connects the app to one socket, `/tmp/impossible.sock`. To run the pod alongside g7sim for the same app, give
+each its own socket and let g7sim's `impossible-mux` hold ImpossiBLE's:
+
+```
+./pod -transport impossible -socket /tmp/impossible-pod.sock
+g7sim -transport impossible -socket /tmp/impossible-g7.sock
+impossible-mux /tmp/impossible-g7.sock /tmp/impossible-pod.sock
+```
+
+The pod holds a connect that asks for a start delay (`CBConnectPeripheralOptionStartDelayKey`) for that delay, as iOS
+does, and hangs up after 3 minutes without a command, as above.
 
 # Original README.md
 
