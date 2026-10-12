@@ -5,15 +5,12 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"errors"
-	"fmt"
 	"hash/crc32"
 	"sync"
 	"time"
 
 	"github.com/avereha/pod/pkg/message"
 	"github.com/davecgh/go-spew/spew"
-	"github.com/paypal/gatt"
-	"github.com/paypal/gatt/linux/cmd"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -28,6 +25,39 @@ var (
 	CmdFail    = Packet([]byte{5})
 )
 
+// Radio carries the pod's command and data characteristics to the phone:
+// a Bluetooth adapter, or the iOS Simulator through ImpossiBLE.
+type Radio interface {
+	NotifyCmd(Packet) error
+	NotifyData(Packet) error
+	Advertise(podId []byte) error
+	Disconnect()
+}
+
+const AdvertisedName = " :: Fake POD ::"
+
+// AdvertisedServices is the list of 16-bit service UUIDs a DASH pod
+// advertises; the 4th and 5th carry its id, FFFF FFFE before pairing.
+func AdvertisedServices(podId []byte) []uint16 {
+	idOne, idTwo := uint16(0xffff), uint16(0xfffe)
+	if podId != nil {
+		idOne = binary.BigEndian.Uint16(podId[0:2])
+		idTwo = binary.BigEndian.Uint16(podId[2:4])
+	}
+	return []uint16{
+		0x4024,
+		0x2470,
+		0x000a,
+		idOne,
+		idTwo,
+		// these 4 are copied from lotNo and lotSeq from fixed string in versionresponse.go
+		0x0814,
+		0x6DB1,
+		0x0006,
+		0xE451,
+	}
+}
+
 type Ble struct {
 	dataInput  chan Packet
 	cmdInput   chan Packet
@@ -39,38 +69,18 @@ type Ble struct {
 
 	stopLoop    chan bool
 	reconnected chan bool
-	device      *gatt.Device
-	central     *gatt.Central
+	radio       Radio
 
 	// connGen counts central connections; servingGen is the one the
 	// message loop was started for. They differ only after a real reconnect.
 	genMtx     sync.Mutex
 	connGen    uint64
 	servingGen uint64
-
-	cmdNotifier    gatt.Notifier
-	cmdNotifierMtx sync.Mutex
-
-	dataNotifier    gatt.Notifier
-	dataNotifierMtx sync.Mutex
+	connected  bool
 }
 
-var DefaultServerOptions = []gatt.Option{
-	gatt.LnxMaxConnections(1),
-	gatt.LnxDeviceID(-1, true),
-	gatt.LnxSetAdvertisingParameters(&cmd.LESetAdvertisingParameters{
-		AdvertisingIntervalMin: 0x00f4,
-		AdvertisingIntervalMax: 0x00f4,
-		AdvertisingChannelMap:  0x7,
-	}),
-}
-
-func New(adapterID string, podId []byte) (*Ble, error) {
-	d, err := gatt.NewDevice(DefaultServerOptions...)
-	if err != nil {
-		log.Fatalf("pkg bluetooth; failed to open device, err: %s", err)
-	}
-
+// New starts the pod's link layer on the radio that attach returns.
+func New(attach func(*Ble) (Radio, error)) (*Ble, error) {
 	b := &Ble{
 		dataInput:     make(chan Packet, 5),
 		cmdInput:      make(chan Packet, 5),
@@ -79,178 +89,79 @@ func New(adapterID string, podId []byte) (*Ble, error) {
 		messageInput:  make(chan *message.Message, 5),
 		messageOutput: make(chan *message.Message, 2),
 		reconnected:   make(chan bool, 1),
-		device:        &d,
 	}
-
-	d.Handle(
-		gatt.CentralConnected(func(c gatt.Central) {
-			fmt.Println("pkg bluetooth; ** New connection from: ", c.ID())
-			b.StopMessageLoop()
-			b.central = &c
-			b.genMtx.Lock()
-			b.connGen++
-			b.genMtx.Unlock()
-			// Wake any in-flight CommandLoop so it can tear down and
-			// re-establish a session on this new connection.
-			select {
-			case b.reconnected <- true:
-			default:
-			}
-		}),
-		gatt.CentralDisconnected(func(c gatt.Central) {
-			log.Tracef("pkg bluetooth; ** disconnect: %s", c.ID())
-		}),
-	)
-
-	// Start cmd writing goroutine
-	go func() {
-		for {
-			packet := <-b.cmdOutput
-			b.cmdNotifierMtx.Lock()
-			if b.cmdNotifier.Done() {
-				log.Fatalf("pkg bluetooth; CMD closed")
-			}
-			ret, err := b.cmdNotifier.Write(packet)
-			b.cmdNotifierMtx.Unlock()
-			log.Tracef("pkg bluetooth; CMD notification return: %d/%s", ret, hex.EncodeToString(packet))
-			if err != nil {
-				log.Fatalf("pkg bluetooth; error writing CMD: %s", err)
-			}
-		}
-	}()
-
-	// Start data writing goroutine
-	go func() {
-		for {
-			packet := <-b.dataOutput
-			b.dataNotifierMtx.Lock()
-			if b.dataNotifier.Done() {
-				log.Fatalf("pkg bluetooth; DATA closed")
-			}
-			ret, err := b.dataNotifier.Write(packet)
-			b.dataNotifierMtx.Unlock()
-			log.Tracef("pkg bluetooth; DATA notification return: %d/%s", ret, hex.EncodeToString(packet))
-			if err != nil {
-				log.Fatalf("pkg bluetooth; error writing DATA: %s ", err)
-			}
-		}
-	}()
-
-	// A mandatory handler for monitoring device state.
-	onStateChanged := func(d gatt.Device, s gatt.State) {
-		fmt.Printf("state: %s\n", s)
-		switch s {
-		case gatt.StatePoweredOn:
-			var serviceUUID = gatt.MustParseUUID("1a7e-4024-e3ed-4464-8b7e-751e03d0dc5f")
-			var cmdCharUUID = gatt.MustParseUUID("1a7e-2441-e3ed-4464-8b7e-751e03d0dc5f")
-			var dataCharUUID = gatt.MustParseUUID("1a7e-2442-e3ed-4464-8b7e-751e03d0dc5f")
-
-			s := gatt.NewService(serviceUUID)
-
-			cmdCharacteristic := s.AddCharacteristic(cmdCharUUID)
-			cmdCharacteristic.HandleWriteFunc(
-				func(r gatt.Request, data []byte) (status byte) {
-					log.Tracef("received CMD,  %x", data)
-					ret := make([]byte, len(data))
-					copy(ret, data)
-					b.cmdInput <- Packet(ret)
-					return 0
-				})
-
-			cmdCharacteristic.HandleNotifyFunc(
-				func(r gatt.Request, n gatt.Notifier) {
-					b.cmdNotifierMtx.Lock()
-					b.cmdNotifier = n
-					b.cmdNotifierMtx.Unlock()
-					log.Infof("pkg bluetooth; handling CMD notifications on new connection from:  %s", r.Central.ID())
-				})
-
-			dataCharacteristic := s.AddCharacteristic(dataCharUUID)
-			dataCharacteristic.HandleNotifyFunc(
-				func(r gatt.Request, n gatt.Notifier) {
-					b.dataNotifierMtx.Lock()
-					b.dataNotifier = n
-					b.dataNotifierMtx.Unlock()
-					log.Infof("pkg bluetooth; handling DATA notifications on new connection from: %s", r.Central.ID())
-					log.Infof("     *** OK to send commands from the phone app ***")
-				})
-
-			dataCharacteristic.HandleWriteFunc(
-				func(r gatt.Request, data []byte) (status byte) {
-					log.Tracef("pkg bluetooth; received DATA,%x, -- %d", data, len(data))
-					ret := make([]byte, len(data))
-					copy(ret, data)
-					b.dataInput <- Packet(ret)
-					return 0
-				})
-
-			err = d.AddService(s)
-			if err != nil {
-				log.Fatalf("pkg bluetooth; could not add service: %s", err)
-			}
-
-			podIdServiceOne := gatt.UUID16(0xffff)
-			podIdServiceTwo := gatt.UUID16(0xfffe)
-			if podId != nil {
-				podIdServiceOne = gatt.UUID16(binary.BigEndian.Uint16(podId[0:2]))
-				podIdServiceTwo = gatt.UUID16(binary.BigEndian.Uint16(podId[2:4]))
-			}
-
-			// Advertise device name and service's UUIDs.
-			err = d.AdvertiseNameAndServices(" :: Fake POD ::", []gatt.UUID{
-				gatt.UUID16(0x4024),
-
-				gatt.UUID16(0x2470),
-				gatt.UUID16(0x000a),
-
-				podIdServiceOne,
-				podIdServiceTwo,
-
-				// these 4 are copied from lotNo and lotSeq from fixed string in versionresponse.go
-				gatt.UUID16(0x0814),
-				gatt.UUID16(0x6DB1),
-				gatt.UUID16(0x0006),
-				gatt.UUID16(0xE451),
-			})
-			if err != nil {
-				log.Fatalf("pkg bluetooth; could not advertise: %s", err)
-			}
-		default:
-		}
-	}
-	err = d.Init(onStateChanged)
+	r, err := attach(b)
 	if err != nil {
-		log.Fatalf("pkg bluetooth; could not init bluetooth: %s", err)
+		return nil, err
 	}
+	b.radio = r
+
+	go func() {
+		for packet := range b.cmdOutput {
+			if err := b.radio.NotifyCmd(packet); err != nil {
+				log.Warnf("pkg bluetooth; CMD %s not sent: %s", packet, err)
+			}
+		}
+	}()
+	go func() {
+		for packet := range b.dataOutput {
+			if err := b.radio.NotifyData(packet); err != nil {
+				log.Warnf("pkg bluetooth; DATA %s not sent: %s", packet, err)
+			}
+		}
+	}()
 	return b, nil
+}
+
+// Connected is the radio reporting a new connection from the phone.
+func (b *Ble) Connected() {
+	b.StopMessageLoop()
+	// What the previous connection left unread is no part of the new one.
+	for _, ch := range []chan Packet{b.cmdInput, b.dataInput} {
+		for len(ch) > 0 {
+			<-ch
+		}
+	}
+	for len(b.messageInput) > 0 {
+		<-b.messageInput
+	}
+	b.genMtx.Lock()
+	b.connGen++
+	b.connected = true
+	b.genMtx.Unlock()
+	// Wake any in-flight CommandLoop so it can tear down and
+	// re-establish a session on this new connection.
+	select {
+	case b.reconnected <- true:
+	default:
+	}
+}
+
+func (b *Ble) Disconnected() {
+	b.genMtx.Lock()
+	b.connected = false
+	b.genMtx.Unlock()
+}
+
+// IsConnected says whether the phone is connected.
+func (b *Ble) IsConnected() bool {
+	b.genMtx.Lock()
+	defer b.genMtx.Unlock()
+	return b.connected
+}
+
+// CmdWritten and DataWritten are the phone's writes to the two characteristics.
+func (b *Ble) CmdWritten(data []byte) {
+	b.cmdInput <- Packet(append([]byte(nil), data...))
+}
+
+func (b *Ble) DataWritten(data []byte) {
+	b.dataInput <- Packet(append([]byte(nil), data...))
 }
 
 func (b *Ble) RefreshAdvertisingWithSpecifiedId(id []byte) error { // 4 bytes, first 2 usually empty
 	log.Debugf("RefreshAdvertisingWithSpecifiedId %x", id)
-	// Looking at the paypal/gatt source code, we don't need to call StopAdvertising,
-	// but just call AdvertiseNameAndServices and it should update
-
-	log.Tracef("podIdServiceOne %v", gatt.UUID16(binary.BigEndian.Uint16(id[0:2])))
-	log.Tracef("podIdServiceTwo %v", gatt.UUID16(binary.BigEndian.Uint16(id[2:4])))
-	err := (*b.device).AdvertiseNameAndServices(" :: Fake POD ::", []gatt.UUID{
-		gatt.UUID16(0x4024),
-
-		gatt.UUID16(0x2470),
-		gatt.UUID16(0x000a),
-
-		gatt.UUID16(binary.BigEndian.Uint16(id[0:2])),
-		gatt.UUID16(binary.BigEndian.Uint16(id[2:4])),
-
-		// these 4 are copied from lotNo and lotSeq from fixed string in versionresponse.go
-		gatt.UUID16(0x0814),
-		gatt.UUID16(0x6DB1),
-		gatt.UUID16(0x0006),
-		gatt.UUID16(0xE451),
-	})
-	if err != nil {
-		log.Infof("pkg bluetooth; could not re-advertise: %s", err)
-	}
-	return err
+	return b.radio.Advertise(id)
 }
 
 func (b *Ble) WriteCmd(packet Packet) error {
@@ -319,7 +230,7 @@ func (b *Ble) servingCurrentConnection() bool {
 }
 
 func (b *Ble) ShutdownConnection() {
-	(*b.central).Close()
+	b.radio.Disconnect()
 }
 
 func (b *Ble) WriteMessage(message *message.Message) {

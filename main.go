@@ -2,7 +2,6 @@ package main
 
 import (
 	"flag"
-	"time"
 
 	"github.com/avereha/pod/pkg/api"
 	"github.com/avereha/pod/pkg/bluetooth"
@@ -18,6 +17,9 @@ func main() {
 	// if both verbose and quiet are chosen, e.g., -v -q, the verbose dominates
 	var traceLevel = flag.Bool("v", false, "verbose off by default, TraceLevel")
 	var infoLevel = flag.Bool("q", false, "quiet off by default, InfoLevel")
+	var apiAddr = flag.String("api", ":8080", "address of the control panel and its API")
+	var transport = flag.String("transport", "ble", "ble (a Linux Bluetooth adapter) or impossible (ImpossiBLE's socket, for an app in the iOS Simulator)")
+	var socket = flag.String("socket", "/tmp/impossible.sock", "ImpossiBLE socket for -transport impossible")
 
 	flag.Parse()
 
@@ -35,34 +37,44 @@ func main() {
 		FullTimestamp: true,
 	})
 
-	// TODO: This is kinda ugly, move state reader into own file and pass state to both BLE and pod
-	state := &pod.PODState{
-		Filename: *stateFile,
-	}
-	var err error
-	if !(*freshState) {
+	var state *pod.PODState
+	if *freshState {
+		state = pod.NewFreshState(*stateFile)
+	} else {
+		var err error
 		state, err = pod.NewState(*stateFile)
 		if err != nil {
 			log.Fatalf("pkg pod; could not restore pod state from %s: %+v", *stateFile, err)
 		}
 	}
+	if state.PeripheralID == "" {
+		state.PeripheralID = bluetooth.PeripheralID()
+	}
 
 	log.Tracef("podId %x", state.Id)
 
-	ble, err := bluetooth.New("hci0", state.Id)
-	//defer ble.Close()
+	var attach func(*bluetooth.Ble) (bluetooth.Radio, error)
+	switch *transport {
+	case "ble":
+		attach = func(b *bluetooth.Ble) (bluetooth.Radio, error) { return bluetooth.NewGattRadio(b, state.Id) }
+	case "impossible":
+		attach = func(b *bluetooth.Ble) (bluetooth.Radio, error) {
+			return bluetooth.NewSimRadio(b, *socket, state.PeripheralID, state.Id)
+		}
+	default:
+		log.Fatalf("transport %q: want ble or impossible", *transport)
+	}
+	ble, err := bluetooth.New(attach)
 	if err != nil {
-		log.Fatalf("Could not start BLE: %s", err)
+		log.Fatalf("Could not start %s: %s", *transport, err)
 	}
 
-	p := pod.New(ble, *stateFile, *freshState)
+	p := pod.New(ble, state)
 	go func() {
 		p.StartAcceptingCommands()
 	}()
 
 	log.Info("Starting API")
 	s := api.New(p)
-	s.Start()
-
-	time.Sleep(9999 * time.Second)
+	s.Start(*apiAddr)
 }

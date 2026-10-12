@@ -44,7 +44,19 @@ type PODState struct {
 	ExtendedBolusActive bool      `toml:"extended_bolus_active"`
 	BasalActive         bool      `toml:"basal_active"`
 
+	// PeripheralID is the identifier the iOS Simulator transport gives the pod.
+	PeripheralID string `toml:"peripheral_id"`
+
 	Filename string
+}
+
+// NewFreshState is a new pod, not yet paired.
+func NewFreshState(filename string) *PODState {
+	return &PODState{
+		Reservoir:      150 / 0.05,
+		ActivationTime: time.Now(),
+		Filename:       filename,
+	}
 }
 
 func NewState(filename string) (*PODState, error) {
