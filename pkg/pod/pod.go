@@ -50,7 +50,7 @@ func New(ble *bluetooth.Ble, state *PODState) *Pod {
 		ble:   ble,
 		state: state,
 	}
-	ret.snapshot = *state
+	ret.takeSnapshot()
 	return ret
 }
 

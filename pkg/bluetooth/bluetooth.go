@@ -31,22 +31,57 @@ type Radio interface {
 	NotifyCmd(Packet) error
 	NotifyData(Packet) error
 	Advertise(podId []byte) error
+	AdvertiseState(state AdvertState) error
 	Disconnect()
 }
 
 const AdvertisedName = " :: Fake POD ::"
 
+// AdvertState is what a paired pod advertises of its state: its fault
+// code and its firing alert slots, 0 when there are none.
+type AdvertState struct {
+	Fault  uint8
+	Alerts uint8
+}
+
+// status is the 2nd service UUID: real pods go C001 → C005 when an alert
+// fires → C00A on a fault (captured in OmnipodKit). A fault is a new
+// advertisement, which wakes a suspended app scanning for it.
+func (s AdvertState) status() uint16 {
+	switch {
+	case s.Fault != 0:
+		return 0xC00A
+	case s.Alerts != 0:
+		return 0xC005
+	}
+	return 0xC001
+}
+
+// ManufacturerData is the pod's iBeacon-shaped manufacturer data, with the
+// status word OmnipodKit decodes 7 bytes from its end: 00, 02 (or the fault
+// code), the fault code, the alert slots. A captured occlusion read 00141400.
+func (s AdvertState) ManufacturerData() []byte {
+	b1 := uint8(0x02)
+	if s.Fault != 0 {
+		b1 = s.Fault
+	}
+	data := []byte{0x4c, 0x00, 0x02, 0x15}
+	data = append(data, make([]byte, 14)...)
+	return append(data, 0x00, b1, s.Fault, s.Alerts, 0x00, 0x00, 0xc5)
+}
+
 // AdvertisedServices is the list of 16-bit service UUIDs a DASH pod
 // advertises; the 4th and 5th carry its id, FFFF FFFE before pairing.
-func AdvertisedServices(podId []byte) []uint16 {
-	idOne, idTwo := uint16(0xffff), uint16(0xfffe)
+func AdvertisedServices(podId []byte, state AdvertState) []uint16 {
+	idOne, idTwo, second := uint16(0xffff), uint16(0xfffe), uint16(0x2470)
 	if podId != nil {
 		idOne = binary.BigEndian.Uint16(podId[0:2])
 		idTwo = binary.BigEndian.Uint16(podId[2:4])
+		second = state.status()
 	}
 	return []uint16{
 		0x4024,
-		0x2470,
+		second,
 		0x000a,
 		idOne,
 		idTwo,
@@ -58,9 +93,22 @@ func AdvertisedServices(podId []byte) []uint16 {
 	}
 }
 
+// input is one connection's writes from the phone. Each connection gets
+// its own, so a reader left over from an earlier one never takes them.
+type input struct {
+	cmd    chan Packet
+	data   chan Packet
+	closed chan bool // a newer connection replaced this one
+}
+
+func newInput() *input {
+	return &input{cmd: make(chan Packet, 5), data: make(chan Packet, 5), closed: make(chan bool)}
+}
+
+var errStopped = errors.New("the connection ended")
+
 type Ble struct {
-	dataInput  chan Packet
-	cmdInput   chan Packet
+	in         *input // guarded by genMtx
 	dataOutput chan Packet
 	cmdOutput  chan Packet
 
@@ -82,8 +130,7 @@ type Ble struct {
 // New starts the pod's link layer on the radio that attach returns.
 func New(attach func(*Ble) (Radio, error)) (*Ble, error) {
 	b := &Ble{
-		dataInput:     make(chan Packet, 5),
-		cmdInput:      make(chan Packet, 5),
+		in:            newInput(),
 		dataOutput:    make(chan Packet, 5),
 		cmdOutput:     make(chan Packet, 5),
 		messageInput:  make(chan *message.Message, 5),
@@ -116,16 +163,12 @@ func New(attach func(*Ble) (Radio, error)) (*Ble, error) {
 // Connected is the radio reporting a new connection from the phone.
 func (b *Ble) Connected() {
 	b.StopMessageLoop()
-	// What the previous connection left unread is no part of the new one.
-	for _, ch := range []chan Packet{b.cmdInput, b.dataInput} {
-		for len(ch) > 0 {
-			<-ch
-		}
-	}
 	for len(b.messageInput) > 0 {
 		<-b.messageInput
 	}
 	b.genMtx.Lock()
+	close(b.in.closed)
+	b.in = newInput()
 	b.connGen++
 	b.connected = true
 	b.genMtx.Unlock()
@@ -152,16 +195,38 @@ func (b *Ble) IsConnected() bool {
 
 // CmdWritten and DataWritten are the phone's writes to the two characteristics.
 func (b *Ble) CmdWritten(data []byte) {
-	b.cmdInput <- Packet(append([]byte(nil), data...))
+	b.input().cmd <- Packet(append([]byte(nil), data...))
 }
 
 func (b *Ble) DataWritten(data []byte) {
-	b.dataInput <- Packet(append([]byte(nil), data...))
+	b.input().data <- Packet(append([]byte(nil), data...))
+}
+
+func (b *Ble) input() *input {
+	b.genMtx.Lock()
+	defer b.genMtx.Unlock()
+	return b.in
+}
+
+// read takes the next packet from a connection's channel, or reports that
+// the message loop reading it was stopped.
+func read(ch chan Packet, stop chan bool) (Packet, error) {
+	select {
+	case p := <-ch:
+		return p, nil
+	case <-stop:
+		return nil, errStopped
+	}
 }
 
 func (b *Ble) RefreshAdvertisingWithSpecifiedId(id []byte) error { // 4 bytes, first 2 usually empty
 	log.Debugf("RefreshAdvertisingWithSpecifiedId %x", id)
 	return b.radio.Advertise(id)
+}
+
+// SetAdvertisedState advertises the pod's fault and firing alerts.
+func (b *Ble) SetAdvertisedState(state AdvertState) error {
+	return b.radio.AdvertiseState(state)
 }
 
 func (b *Ble) WriteCmd(packet Packet) error {
@@ -182,14 +247,24 @@ func (b *Ble) writeDataBuffer(buf *bytes.Buffer) error {
 	return b.WriteData(data)
 }
 
+// ReadCmd and ReadData read the current connection, following the phone
+// to a new one.
 func (b *Ble) ReadCmd() (Packet, error) {
-	packet := <-b.cmdInput
-	return packet, nil
+	for {
+		in := b.input()
+		if p, err := read(in.cmd, in.closed); err == nil {
+			return p, nil
+		}
+	}
 }
 
 func (b *Ble) ReadData() (Packet, error) {
-	packet := <-b.dataInput
-	return packet, nil
+	for {
+		in := b.input()
+		if p, err := read(in.data, in.closed); err == nil {
+			return p, nil
+		}
+	}
 }
 
 func (p Packet) String() string {
@@ -237,19 +312,35 @@ func (b *Ble) WriteMessage(message *message.Message) {
 	b.messageOutput <- message
 }
 
-func (b *Ble) loop(stop chan bool) {
+func (b *Ble) loop(stop chan bool, in *input) {
 	for {
 		select {
 		case <-stop:
 			return
+		default:
+		}
+		select {
+		case <-stop:
+			return
 		case msg := <-b.messageOutput:
-			b.writeMessage(msg)
-		case cmd := <-b.cmdInput:
-			msg, err := b.readMessage(cmd)
-			if err != nil {
-				log.Fatalf("pkg bluetooth; error reading message: %s", err)
+			if err := b.writeMessage(msg, in, stop); err != nil {
+				return
 			}
-			b.messageInput <- msg
+		case cmd := <-in.cmd:
+			msg, err := b.readMessage(cmd, in, stop)
+			if err == errStopped {
+				return
+			}
+			if err != nil {
+				// The phone was told it failed and sends it again.
+				log.Errorf("pkg bluetooth; error reading message: %s", err)
+				continue
+			}
+			select {
+			case b.messageInput <- msg:
+			case <-stop:
+				return
+			}
 		}
 	}
 }
@@ -266,7 +357,7 @@ func (b *Ble) StartMessageLoop() {
 	default:
 	}
 	b.stopLoop = make(chan bool)
-	go b.loop(b.stopLoop)
+	go b.loop(b.stopLoop, b.input())
 }
 
 func (b *Ble) StopMessageLoop() {
@@ -277,19 +368,25 @@ func (b *Ble) StopMessageLoop() {
 	}
 }
 
-func (b *Ble) expectCommand(expected Packet) {
-	cmd, _ := b.ReadCmd()
+func (b *Ble) expectCommand(expected Packet, in *input, stop chan bool) error {
+	cmd, err := read(in.cmd, stop)
+	if err != nil {
+		return err
+	}
 	if !bytes.Equal(expected[:1], cmd[:1]) {
 		log.Fatalf("pkg bluetooth; expected command: %s. received command: %s", expected, cmd)
 	}
+	return nil
 }
 
-func (b *Ble) writeMessage(msg *message.Message) {
+func (b *Ble) writeMessage(msg *message.Message, in *input, stop chan bool) error {
 	var buf bytes.Buffer
 	var index = 0
 
 	b.WriteCmd(CmdRTS)
-	b.expectCommand(CmdCTS) // TODO figure out what to do if !CTS
+	if err := b.expectCommand(CmdCTS, in, stop); err != nil { // TODO figure out what to do if !CTS
+		return err
+	}
 	bytes, err := msg.Marshal()
 	if err != nil {
 		log.Fatalf("pkg bluetooth; could not marshal the message %s", err)
@@ -318,7 +415,7 @@ func (b *Ble) writeMessage(msg *message.Message) {
 			buf.Write(bytes[14:])
 			b.writeDataBuffer(&buf)
 		}
-		return
+		return nil
 	}
 
 	size := len(bytes)
@@ -362,10 +459,10 @@ func (b *Ble) writeMessage(msg *message.Message) {
 		}
 		b.writeDataBuffer(&buf)
 	}
-	b.expectCommand(CmdSuccess)
+	return b.expectCommand(CmdSuccess, in, stop)
 }
 
-func (b *Ble) readMessage(cmd Packet) (*message.Message, error) {
+func (b *Ble) readMessage(cmd Packet, in *input, stop chan bool) (*message.Message, error) {
 	var buf bytes.Buffer
 	var checksum []byte
 
@@ -377,7 +474,10 @@ func (b *Ble) readMessage(cmd Packet) (*message.Message, error) {
 
 	b.WriteCmd(CmdCTS)
 
-	first, _ := b.ReadData()
+	first, err := read(in.data, stop)
+	if err != nil {
+		return nil, err
+	}
 	fragments := int(first[1])
 	expectedIndex := 1
 	oneExtra := false
@@ -394,7 +494,10 @@ func (b *Ble) readMessage(cmd Packet) (*message.Message, error) {
 		buf.Write(first[2:20])
 	}
 	for i := 1; i < fragments; i++ {
-		data, _ := b.ReadData()
+		data, err := read(in.data, stop)
+		if err != nil {
+			return nil, err
+		}
 		if i == expectedIndex {
 			buf.Write(data[1:20])
 		} else {
@@ -406,7 +509,10 @@ func (b *Ble) readMessage(cmd Packet) (*message.Message, error) {
 		expectedIndex++
 	}
 	if fragments != 0 {
-		data, _ := b.ReadData()
+		data, err := read(in.data, stop)
+		if err != nil {
+			return nil, err
+		}
 		len := data[1]
 		if len > 14 {
 			oneExtra = true
@@ -417,7 +523,10 @@ func (b *Ble) readMessage(cmd Packet) (*message.Message, error) {
 	}
 	log.Tracef("pkg bluetooth; One extra: %t", oneExtra)
 	if oneExtra {
-		data, _ := b.ReadData()
+		data, err := read(in.data, stop)
+		if err != nil {
+			return nil, err
+		}
 		buf.Write(data[2 : data[1]+2])
 	}
 	bytes := buf.Bytes()
