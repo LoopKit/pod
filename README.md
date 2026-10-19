@@ -1,6 +1,6 @@
 # pod
 
-Fake pod implementation
+Fake pod implementation: an Omnipod DASH by default, or an Omnipod 5 with `-mode o5`.
 
 * The original 0pen-dash repository from which this was forked was removed by the owner.
 
@@ -13,6 +13,8 @@ Fake pod implementation
 * The websocket API at `/ws`, used by the separate [NodeJS/React frontend](https://github.com/ps2/pod_simulator_frontend), is still there.
 
 * It can serve an app in the iOS Simulator instead of a phone; see [Run against the iOS Simulator](#run-against-the-ios-simulator).
+
+* With `-mode o5` it is an Omnipod 5 pod for [OmnipodKit](https://github.com/loopandlearn/OmnipodKit); see [Simulate an Omnipod 5](#simulate-an-omnipod-5).
 
 Requirements:
 1. Version of iOS code (Loop app) that will interact with this simulator - Loop dev branch or FreeAPS freeaps_dev branch
@@ -108,6 +110,35 @@ panel reaches a backgrounded Loop the way a real one does, through its scan for 
 the advertisement wakes the suspended app. A real pod's fault is final, and Loop treats it so: clearing the fault here
 doesn't restart Loop's scan for `C00A`. Relaunch Loop before testing another fault.
 
+## Simulate an Omnipod 5
+
+```
+./pod -mode o5 -fresh
+```
+
+pairs as an Omnipod 5 with an app using OmnipodKit, over Bluetooth or `-transport impossible`. The mode is kept in
+the state file, so a restart needs no `-mode` (a different `-mode` is ignored with a warning; `-fresh` makes a new
+pod of the given mode). The control panel and `GET /status` show the mode.
+
+What differs from the DASH pod, each as OmnipodKit expects it:
+
+* It advertises one service UUID, `CE1F923D-C539-48EA-7300-0A<controller id>00`, with `FFFFFFFE` until it has paired
+  and `02` as the last byte on a fault, and serves its data on characteristic `1A7E2443`.
+* Messages travel in 244-byte packets with no RTS/CTS.
+* Pairing adds SPS0, P-256 keys, and the SPS2.1/SPS2 exchange of certificates and signatures. The pod signs with
+  a key and self-signed certificate it makes at its first pairing and keeps in the state file, and remembers the
+  phone's signing key from the phone's SPS2 certificate.
+* After AssignAddress it answers the AID setup commands (UTC time, TDI, target glucose profile, DIA, EGV, insulin
+  history) with the values the app set.
+* Bolus, basal, temp basal, cancel and deactivate commands must be signed by the phone; one that is not, or whose
+  signature does not verify, is answered with error `0x2A`, and counted on the control panel.
+* It reports product id 5 with the firmware, lot and tid of OmnipodKit's captured pod, and ends every response with
+  the Omnipod CRC16 that OmnipodKit checks on an Omnipod 5.
+
+OmnipodKit needs its own O5 registration data (certificates and signing key) to pair; the pod does not validate the
+certificate chain, as OmnipodKit does not validate the pod's. See `docs/O5_PORT_PLAN.md` for the protocol details and
+their sources.
+
 # Original README.md
 
 We maintained the original README file below. It may be helpful if someone plans to cross-compile the code and just transfer the executable.
@@ -154,6 +185,8 @@ $ ./pod  --help
 Usage of ./pod:
   -fresh
         start fresh. not activated, empty state
+  -mode string
+        the pod to simulate: dash (Omnipod DASH) or o5 (Omnipod 5) (default "dash")
   -state string
         pod state (default "state.toml")
 

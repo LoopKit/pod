@@ -39,7 +39,7 @@ type Pod struct {
 
 	// aid holds what an Omnipod 5 phone set with its AID setup commands.
 	aid aid.Settings
-	// badSignatures counts type 4 commands whose signature did not verify.
+	// badSignatures counts commands refused for want of a valid signature.
 	badSignatures int
 
 	// snapshot is the state as of the last completed command, for the
@@ -456,6 +456,9 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 			if o5 && command.RequiresSignature(cmd.GetType()) && !signed {
 				// A real Omnipod 5 refuses the command rather than run it.
 				log.Errorf("pkg pod; %s was not validly signed; answering error 0x%02X", command.CommandName[cmd.GetType()], response.ErrorO5InvalidCommand)
+				if msg.Type != message.MessageTypeEncryptedSigned {
+					p.badSignatures++ // verifySignature counted a bad one already
+				}
 				rsp = &response.ErrorResponse{Code: response.ErrorO5InvalidCommand, FaultEvent: p.state.FaultEvent, PodProgress: p.state.PodProgress}
 			} else {
 				if data[13] == 0x1c {
