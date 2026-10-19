@@ -12,11 +12,12 @@ import (
 
 // gattRadio serves the pod from a Linux Bluetooth adapter.
 type gattRadio struct {
+	ble     *Ble
 	device  gatt.Device
 	central gatt.Central
 
 	advertMtx sync.Mutex
-	podId     []byte
+	id        []byte
 	state     AdvertState
 
 	cmdNotifier    gatt.Notifier
@@ -36,13 +37,14 @@ var DefaultServerOptions = []gatt.Option{
 	}),
 }
 
-// NewGattRadio serves the pod from the first Bluetooth adapter.
-func NewGattRadio(b *Ble, podId []byte) (Radio, error) {
+// NewGattRadio serves the pod from the first Bluetooth adapter, advertising
+// id (see Radio.Advertise).
+func NewGattRadio(b *Ble, id []byte) (Radio, error) {
 	d, err := gatt.NewDevice(DefaultServerOptions...)
 	if err != nil {
 		log.Fatalf("pkg bluetooth; failed to open device, err: %s", err)
 	}
-	r := &gattRadio{device: d, podId: podId}
+	r := &gattRadio{ble: b, device: d, id: id}
 
 	d.Handle(
 		gatt.CentralConnected(func(c gatt.Central) {
@@ -61,13 +63,9 @@ func NewGattRadio(b *Ble, podId []byte) (Radio, error) {
 		fmt.Printf("state: %s\n", s)
 		switch s {
 		case gatt.StatePoweredOn:
-			var serviceUUID = gatt.MustParseUUID("1a7e-4024-e3ed-4464-8b7e-751e03d0dc5f")
-			var cmdCharUUID = gatt.MustParseUUID("1a7e-2441-e3ed-4464-8b7e-751e03d0dc5f")
-			var dataCharUUID = gatt.MustParseUUID("1a7e-2442-e3ed-4464-8b7e-751e03d0dc5f")
+			s := gatt.NewService(gatt.MustParseUUID(podServiceUUID))
 
-			s := gatt.NewService(serviceUUID)
-
-			cmdCharacteristic := s.AddCharacteristic(cmdCharUUID)
+			cmdCharacteristic := s.AddCharacteristic(gatt.MustParseUUID(cmdCharUUID))
 			cmdCharacteristic.HandleWriteFunc(
 				func(r gatt.Request, data []byte) (status byte) {
 					log.Tracef("received CMD,  %x", data)
@@ -83,7 +81,7 @@ func NewGattRadio(b *Ble, podId []byte) (Radio, error) {
 					log.Infof("pkg bluetooth; handling CMD notifications on new connection from:  %s", req.Central.ID())
 				})
 
-			dataCharacteristic := s.AddCharacteristic(dataCharUUID)
+			dataCharacteristic := s.AddCharacteristic(gatt.MustParseUUID(DataCharUUID(b.Mode())))
 			dataCharacteristic.HandleNotifyFunc(
 				func(req gatt.Request, n gatt.Notifier) {
 					r.dataNotifierMtx.Lock()
@@ -120,20 +118,27 @@ func NewGattRadio(b *Ble, podId []byte) (Radio, error) {
 
 func (r *gattRadio) advertise() error {
 	r.advertMtx.Lock()
-	podId, state := r.podId, r.state
+	id, state := r.id, r.state
 	r.advertMtx.Unlock()
-	// paypal/gatt advertises no manufacturer data.
+	m := r.ble.Mode()
 	var uuids []gatt.UUID
-	for _, u := range AdvertisedServices(podId, state) {
-		uuids = append(uuids, gatt.UUID16(u))
+	for _, u := range AdvertisedServices(m, id, state) {
+		uuids = append(uuids, gatt.MustParseUUID(u.String()))
 	}
-	return r.device.AdvertiseNameAndServices(AdvertisedName, uuids)
+	if m.IsO5() {
+		// The 128-bit UUID and the manufacturer data fit the 31 bytes; the
+		// name goes in the scan response.
+		return r.device.AdvertiseNameServicesMfgData(AdvertisedName(m, id), uuids, ManufacturerData(m, state))
+	}
+	// A DASH pod's nine UUIDs fill the packet; paypal/gatt advertises no
+	// manufacturer data for it.
+	return r.device.AdvertiseNameAndServices(AdvertisedName(m, id), uuids)
 }
 
 // Advertise updates the advertisement; paypal/gatt needs no StopAdvertising first.
-func (r *gattRadio) Advertise(podId []byte) error {
+func (r *gattRadio) Advertise(id []byte) error {
 	r.advertMtx.Lock()
-	r.podId = podId
+	r.id = id
 	r.advertMtx.Unlock()
 	err := r.advertise()
 	if err != nil {

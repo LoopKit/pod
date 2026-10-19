@@ -44,7 +44,7 @@ type PODState struct {
 	FaultTime        uint16 `toml:"fault_time"`
 	Delivered        uint16 `toml:"delivered"`
 
-	TriggerTimes     [8]uint16 `toml:"trigger_times"`
+	TriggerTimes [8]uint16 `toml:"trigger_times"`
 
 	// At some point these could be replaced with details
 	// of each kind of delivery (volume, start time, schedule, etc)

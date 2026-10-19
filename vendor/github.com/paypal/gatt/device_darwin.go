@@ -103,6 +103,11 @@ func (d *device) AdvertiseNameAndServices(name string, ss []UUID) error {
 	return nil
 }
 
+func (d *device) AdvertiseNameServicesMfgData(name string, ss []UUID, mfg []byte) error {
+	// CoreBluetooth advertises no manufacturer data from a peripheral.
+	return d.AdvertiseNameAndServices(name, ss)
+}
+
 func (d *device) AdvertiseIBeaconData(data []byte) error {
 	var utsname xpc.Utsname
 	xpc.Uname(&utsname)

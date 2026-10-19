@@ -196,12 +196,23 @@ func (a *AdvPacket) AppendManufacturerData(id uint16, b []byte) *AdvPacket {
 
 // AppendUUIDFit appends a BLE advertised service UUID
 // packet field if it fits in the packet, and reports whether the UUID fit.
+// 16-bit and 128-bit UUIDs go in a field each of their own type; a list of
+// 16-bit UUIDs is written as before.
 func (a *AdvPacket) AppendUUIDFit(uu []UUID) bool {
-	var b bytes.Buffer
+	var b16, b128 bytes.Buffer
 	for _, u := range uu {
-		b.Write(u.b)
+		if u.Len() == 16 {
+			b128.Write(u.b)
+		} else {
+			b16.Write(u.b)
+		}
 	}
-	a.AppendField(typeAllUUID16, b.Bytes())
+	if b16.Len() > 0 || b128.Len() == 0 {
+		a.AppendField(typeAllUUID16, b16.Bytes())
+	}
+	if b128.Len() > 0 {
+		a.AppendField(typeAllUUID128, b128.Bytes())
+	}
 
 	// Iterate all UUIDs to see if they fit in the packet or not.
 	/*	fit, l := true, len(a.b)
