@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/avereha/pod/pkg/message"
+	"github.com/avereha/pod/pkg/mode"
 	"github.com/davecgh/go-spew/spew"
 	log "github.com/sirupsen/logrus"
 )
@@ -109,6 +110,8 @@ func newInput() *input {
 var errStopped = errors.New("the connection ended")
 
 type Ble struct {
+	mode mode.Mode
+
 	in         *input // guarded by genMtx
 	dataOutput chan Packet
 	cmdOutput  chan Packet
@@ -128,9 +131,11 @@ type Ble struct {
 	connected  bool
 }
 
-// New starts the pod's link layer on the radio that attach returns.
-func New(attach func(*Ble) (Radio, error)) (*Ble, error) {
+// New starts the pod's link layer, for a DASH or Omnipod 5 pod, on the
+// radio that attach returns.
+func New(m mode.Mode, attach func(*Ble) (Radio, error)) (*Ble, error) {
 	b := &Ble{
+		mode:          m.Normalized(),
 		in:            newInput(),
 		dataOutput:    make(chan Packet, 5),
 		cmdOutput:     make(chan Packet, 5),
@@ -160,6 +165,9 @@ func New(attach func(*Ble) (Radio, error)) (*Ble, error) {
 	}()
 	return b, nil
 }
+
+// Mode is the pod this link layer serves.
+func (b *Ble) Mode() mode.Mode { return b.mode }
 
 // Connected is the radio reporting a new connection from the phone.
 func (b *Ble) Connected() {

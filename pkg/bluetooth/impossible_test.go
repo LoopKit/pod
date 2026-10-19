@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/avereha/pod/pkg/mode"
 )
 
 type fakeApp struct {
@@ -51,7 +53,7 @@ func TestSimRadioPairsAndCarriesBothCharacteristics(t *testing.T) {
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "impossible.sock")
 	const id = "11111111-2222-4333-8444-555555555555"
-	b, err := New(func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil) })
+	b, err := New(mode.Dash, func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +149,7 @@ func TestSimRadioHoldsAConnectForItsStartDelay(t *testing.T) {
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "impossible.sock")
 	const id = "11111111-2222-4333-8444-555555555555"
-	b, err := New(func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil) })
+	b, err := New(mode.Dash, func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil) })
 	if err != nil {
 		t.Fatal(err)
 	}

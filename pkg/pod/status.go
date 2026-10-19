@@ -26,6 +26,9 @@ var progressNames = map[response.PodProgress]string{
 
 // Status is the pod as the control panel shows it.
 type Status struct {
+	Mode                string    `json:"mode"`
+	ModeName            string    `json:"modeName"`
+	ControllerID        string    `json:"controllerId"`
 	ID                  string    `json:"id"`
 	Paired              bool      `json:"paired"`
 	Connected           bool      `json:"connected"`
@@ -80,7 +83,14 @@ func (p *Pod) Status() Status {
 	if len(s.Id) == 4 {
 		id = fmt.Sprintf("%08X", s.Id)
 	}
+	controller := ""
+	if len(s.ControllerID) == 4 {
+		controller = fmt.Sprintf("%08X", s.ControllerID)
+	}
 	return Status{
+		Mode:                s.Mode.String(),
+		ModeName:            s.Mode.Describe(),
+		ControllerID:        controller,
 		ID:                  id,
 		Paired:              s.LTK != nil,
 		Connected:           p.ble.IsConnected(),

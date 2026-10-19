@@ -5,6 +5,7 @@ import (
 
 	"github.com/avereha/pod/pkg/api"
 	"github.com/avereha/pod/pkg/bluetooth"
+	"github.com/avereha/pod/pkg/mode"
 	"github.com/avereha/pod/pkg/pod"
 
 	"github.com/sirupsen/logrus"
@@ -14,6 +15,7 @@ import (
 func main() {
 	var stateFile = flag.String("state", "state.toml", "pod state")
 	var freshState = flag.Bool("fresh", false, "start fresh. not activated, empty state")
+	var modeFlag = flag.String("mode", "dash", "the pod to simulate: dash (Omnipod DASH) or o5 (Omnipod 5)")
 	// if both verbose and quiet are chosen, e.g., -v -q, the verbose dominates
 	var traceLevel = flag.Bool("v", false, "verbose off by default, TraceLevel")
 	var infoLevel = flag.Bool("q", false, "quiet off by default, InfoLevel")
@@ -22,6 +24,11 @@ func main() {
 	var socket = flag.String("socket", "/tmp/impossible.sock", "ImpossiBLE socket for -transport impossible")
 
 	flag.Parse()
+
+	podMode, err := mode.Parse(*modeFlag)
+	if err != nil {
+		log.Fatalf("-mode: %s", err)
+	}
 
 	if *traceLevel {
 		log.SetLevel(log.TraceLevel)
@@ -39,18 +46,24 @@ func main() {
 
 	var state *pod.PODState
 	if *freshState {
-		state = pod.NewFreshState(*stateFile)
+		state = pod.NewFreshState(*stateFile, podMode)
 	} else {
-		var err error
 		state, err = pod.NewState(*stateFile)
 		if err != nil {
 			log.Fatalf("pkg pod; could not restore pod state from %s: %+v", *stateFile, err)
 		}
+		// The pod stays what the phone paired with; -mode decides a fresh pod.
+		resolved, conflict := pod.ResolveMode(state, podMode)
+		if conflict {
+			log.Warnf("this pod was created as %s; ignoring -mode %s (use -fresh for a new %s pod)", resolved, podMode, podMode)
+		}
+		state.Mode = resolved
 	}
 	if state.PeripheralID == "" {
 		state.PeripheralID = bluetooth.PeripheralID()
 	}
 
+	log.Infof("simulating an %s pod", state.Mode.Describe())
 	log.Tracef("podId %x", state.Id)
 
 	var attach func(*bluetooth.Ble) (bluetooth.Radio, error)
@@ -64,7 +77,7 @@ func main() {
 	default:
 		log.Fatalf("transport %q: want ble or impossible", *transport)
 	}
-	ble, err := bluetooth.New(attach)
+	ble, err := bluetooth.New(state.Mode, attach)
 	if err != nil {
 		log.Fatalf("Could not start %s: %s", *transport, err)
 	}

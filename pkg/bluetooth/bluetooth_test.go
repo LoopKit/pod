@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/avereha/pod/pkg/message"
+	"github.com/avereha/pod/pkg/mode"
 )
 
 // wire delivers one side's notifications as the other side's writes, or
@@ -41,7 +42,7 @@ func (w *wire) AdvertiseState(AdvertState) error { return nil }
 func (w *wire) Disconnect()                      {}
 
 func newEnd(t *testing.T, w *wire) *Ble {
-	b, err := New(func(*Ble) (Radio, error) { return w, nil })
+	b, err := New(mode.Dash, func(*Ble) (Radio, error) { return w, nil })
 	if err != nil {
 		t.Fatal(err)
 	}
