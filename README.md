@@ -135,9 +135,10 @@ What differs from the DASH pod, each as OmnipodKit expects it:
 * It reports product id 5 with the firmware, lot and tid of OmnipodKit's captured pod, and ends every response with
   the Omnipod CRC16 that OmnipodKit checks on an Omnipod 5.
 
-OmnipodKit needs its own O5 registration data (certificates and signing key) to pair; the pod does not validate the
-certificate chain, as OmnipodKit does not validate the pod's. See `docs/O5_PORT_PLAN.md` for the protocol details and
-their sources.
+OmnipodKit needs O5 registration data (certificates and signing key) to pair; `go run ./cmd/o5keypair` makes
+self-signed data the simulator accepts (the pod does not validate the certificate chain, as OmnipodKit does not
+validate the pod's). See `docs/O5_SIMULATOR_VALIDATION.md` for a step-by-step check with Loop in the iOS Simulator,
+and `docs/O5_PORT_PLAN.md` for the protocol details and their sources.
 
 # Original README.md
 
