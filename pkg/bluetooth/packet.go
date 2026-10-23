@@ -28,6 +28,10 @@ var (
 	O5Layout   = Layout{MaxPayloadSize: 244, MaxFragments: 15, firstHeaderWithoutMiddle: 7, firstHeaderWithMiddle: 2, lastHeader: 6}
 )
 
+// MinMTU is the smallest ATT MTU that carries a whole packet, as a write
+// or a notification holds MTU-3 bytes: 23 for DASH, 247 for an Omnipod 5.
+func (l Layout) MinMTU() int { return l.MaxPayloadSize + 3 }
+
 func (l Layout) firstCapacityWithoutMiddle() int {
 	return l.MaxPayloadSize - l.firstHeaderWithoutMiddle
 }

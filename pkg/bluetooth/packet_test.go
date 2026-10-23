@@ -167,3 +167,22 @@ func ExampleLayout_Split() {
 	fmt.Println(len(packets), len(packets[0]))
 	// Output: 1 25
 }
+
+// A packet goes in one ATT write or notification, which holds MTU-3 bytes.
+func TestMinMTUFitsAWholePacket(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		layout Layout
+		want   int
+	}{
+		{"DASH", DashLayout, 23},
+		{"Omnipod 5", O5Layout, 247},
+	} {
+		if got := tt.layout.MinMTU(); got != tt.want {
+			t.Errorf("%s: MinMTU() = %d, want %d", tt.name, got, tt.want)
+		}
+		if packets := tt.layout.Split(generated(600, 1)); len(packets[0]) > tt.layout.MinMTU()-3 {
+			t.Errorf("%s: a %d-byte packet does not fit MinMTU %d", tt.name, len(packets[0]), tt.layout.MinMTU())
+		}
+	}
+}

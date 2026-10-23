@@ -255,6 +255,9 @@ func New(m mode.Mode, attach func(*Ble) (Radio, error)) (*Ble, error) {
 // Mode is the pod this link layer serves.
 func (b *Ble) Mode() mode.Mode { return b.mode }
 
+// MinMTU is the smallest ATT MTU this pod's packets fit (Layout.MinMTU).
+func (b *Ble) MinMTU() int { return b.layout.MinMTU() }
+
 // Connected is the radio reporting a new connection from the phone.
 func (b *Ble) Connected() {
 	b.StopMessageLoop()

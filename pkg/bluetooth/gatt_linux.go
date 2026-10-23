@@ -25,6 +25,9 @@ type gattRadio struct {
 
 	dataNotifier    gatt.Notifier
 	dataNotifierMtx sync.Mutex
+
+	mtuMtx sync.Mutex
+	mtu    int // the ATT MTU last reported for this connection
 }
 
 var DefaultServerOptions = []gatt.Option{
@@ -50,6 +53,9 @@ func NewGattRadio(b *Ble, id []byte) (Radio, error) {
 		gatt.CentralConnected(func(c gatt.Central) {
 			fmt.Println("pkg bluetooth; ** New connection from: ", c.ID())
 			r.central = c
+			r.mtuMtx.Lock()
+			r.mtu = 0
+			r.mtuMtx.Unlock()
 			b.Connected()
 		}),
 		gatt.CentralDisconnected(func(c gatt.Central) {
@@ -88,12 +94,14 @@ func NewGattRadio(b *Ble, id []byte) (Radio, error) {
 					r.dataNotifier = n
 					r.dataNotifierMtx.Unlock()
 					log.Infof("pkg bluetooth; handling DATA notifications on new connection from: %s", req.Central.ID())
+					r.reportMTU(req.Central)
 					log.Infof("     *** OK to send commands from the phone app ***")
 				})
 
 			dataCharacteristic.HandleWriteFunc(
-				func(r gatt.Request, data []byte) (status byte) {
+				func(req gatt.Request, data []byte) (status byte) {
 					log.Tracef("pkg bluetooth; received DATA,%x, -- %d", data, len(data))
+					r.reportMTU(req.Central)
 					b.DataWritten(data)
 					return 0
 				})
@@ -114,6 +122,27 @@ func NewGattRadio(b *Ble, id []byte) (Radio, error) {
 		log.Fatalf("pkg bluetooth; could not init bluetooth: %s", err)
 	}
 	return r, nil
+}
+
+// reportMTU logs the ATT MTU the phone negotiated when it changes on this
+// connection. The phone proposes it and paypal/gatt accepts up to 256, so
+// the pod cannot raise it; an Omnipod 5 needs 247 for its 244-byte packets,
+// and below that the phone's longer messages never arrive whole.
+func (r *gattRadio) reportMTU(c gatt.Central) {
+	mtu := c.MTU()
+	r.mtuMtx.Lock()
+	changed := mtu != r.mtu
+	r.mtu = mtu
+	r.mtuMtx.Unlock()
+	if !changed {
+		return
+	}
+	if need := r.ble.MinMTU(); mtu < need {
+		log.Warnf("pkg bluetooth; the phone negotiated an ATT MTU of %d, but an %s pod's packets need %d: messages longer than one packet will not get through",
+			mtu, r.ble.Mode().Describe(), need)
+		return
+	}
+	log.Infof("pkg bluetooth; the phone negotiated an ATT MTU of %d", mtu)
 }
 
 func (r *gattRadio) advertise() error {
