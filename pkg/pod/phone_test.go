@@ -83,6 +83,23 @@ func startPod(t *testing.T, m mode.Mode) (*Pod, *phone) {
 
 	state := NewFreshState(filepath.Join(t.TempDir(), "state.toml"), m)
 	p := New(podBle, state)
+	// The pod saves state.toml once it reads the phone's ACK, which can be
+	// after the test has its response; it holds its lock until then.
+	// Cleanups run last-registered first, so this one waits out that save
+	// before t.TempDir's removes the directory. It gives up after 3 s, as a
+	// test that failed mid-exchange can leave the pod waiting for an ACK.
+	t.Cleanup(func() {
+		idle := make(chan bool)
+		go func() {
+			p.mtx.Lock()
+			p.mtx.Unlock()
+			close(idle)
+		}()
+		select {
+		case <-idle:
+		case <-time.After(3 * time.Second):
+		}
+	})
 	podBle.Connected()
 	go p.StartAcceptingCommands()
 	podBle.CmdWritten(append(bluetooth.Packet{6, 1, 4}, testController...))
