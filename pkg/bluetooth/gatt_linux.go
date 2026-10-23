@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/paypal/gatt"
 	"github.com/paypal/gatt/linux/cmd"
@@ -56,6 +57,9 @@ func NewGattRadio(b *Ble, id []byte) (Radio, error) {
 			r.mtuMtx.Lock()
 			r.mtu = 0
 			r.mtuMtx.Unlock()
+			if b.Mode().IsO5() {
+				go r.raiseMTU(c)
+			}
 			b.Connected()
 		}),
 		gatt.CentralDisconnected(func(c gatt.Central) {
@@ -143,6 +147,33 @@ func (r *gattRadio) reportMTU(c gatt.Central) {
 		return
 	}
 	log.Infof("pkg bluetooth; the phone negotiated an ATT MTU of %d", mtu)
+}
+
+// podRxMTU is the largest ATT MTU paypal/gatt takes (handleMTU).
+const podRxMTU = 256
+
+// raiseMTU asks the phone for a larger ATT MTU when the one it offered is
+// too small for the pod's packets (an iPhone has offered 185 where an
+// Omnipod 5 needs 247). iOS starts its own exchange as it connects; the pod
+// waits for it, as one handled after the pod's would lower the MTU again,
+// then starts an exchange of its own, which the phone answers with its Rx
+// MTU. reportMTU logs the outcome.
+func (r *gattRadio) raiseMTU(c gatt.Central) {
+	for i := 0; i < 50 && c.MTU() == 23; i++ { // up to 1 s
+		time.Sleep(20 * time.Millisecond)
+	}
+	mtu := c.MTU()
+	if mtu >= r.ble.MinMTU() {
+		return
+	}
+	asker, ok := c.(interface{ RequestMTU(int) error })
+	if !ok {
+		return
+	}
+	log.Infof("pkg bluetooth; the phone offered an ATT MTU of %d; asking it for %d", mtu, podRxMTU)
+	if err := asker.RequestMTU(podRxMTU); err != nil {
+		log.Warnf("pkg bluetooth; could not ask the phone for a larger ATT MTU: %s", err)
+	}
 }
 
 func (r *gattRadio) advertise() error {

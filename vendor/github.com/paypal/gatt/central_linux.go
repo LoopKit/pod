@@ -18,6 +18,7 @@ const (
 type central struct {
 	attrs       *attrRange
 	mtu         uint16
+	mtuAsked    uint16 // the Rx MTU RequestMTU offered, 0 if none
 	addr        net.HardwareAddr
 	security    security
 	l2conn      io.ReadWriteCloser
@@ -78,6 +79,12 @@ func (c *central) handleReq(b []byte) []byte {
 	switch reqType, req := b[0], b[1:]; reqType {
 	case attOpMtuReq:
 		resp = c.handleMTU(req)
+	case attOpMtuRsp:
+		resp = c.handleMTURsp(req)
+	case attOpError:
+		// The central refused a request of ours (RequestMTU); an error
+		// gets no response.
+		resp = nil
 	case attOpFindInfoReq:
 		resp = c.handleFindInfo(req)
 	case attOpFindByTypeValueReq:
@@ -109,6 +116,34 @@ func (c *central) handleMTU(b []byte) []byte {
 		c.mtu = 256
 	}
 	return []byte{attOpMtuRsp, uint8(c.mtu), uint8(c.mtu >> 8)}
+}
+
+// RequestMTU starts an MTU exchange of our own, as the ATT client, offering
+// mtu (at most 256, as handleMTU takes). A central that offered less in its
+// own exchange may take more when asked; its answer, in handleMTURsp, sets
+// the MTU to the smaller of the two.
+func (c *central) RequestMTU(mtu int) error {
+	if mtu > 256 {
+		mtu = 256
+	}
+	c.mtuAsked = uint16(mtu)
+	_, err := c.l2conn.Write([]byte{attOpMtuReq, uint8(mtu), uint8(mtu >> 8)})
+	return err
+}
+
+// RSP: MtuRsp(0x03), the central's Rx MTU. It is a response, so it gets none.
+func (c *central) handleMTURsp(b []byte) []byte {
+	if c.mtuAsked == 0 || len(b) < 2 {
+		return nil
+	}
+	mtu := binary.LittleEndian.Uint16(b[:2])
+	if mtu > c.mtuAsked {
+		mtu = c.mtuAsked
+	}
+	if mtu >= 23 {
+		c.mtu = mtu
+	}
+	return nil
 }
 
 // REQ: FindInfoReq(0x04), StartHandle, EndHandle
