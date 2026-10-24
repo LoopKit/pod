@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"sync"
 
 	"github.com/paypal/gatt/linux/cmd"
 )
@@ -34,6 +35,11 @@ type conn struct {
 	hci  *HCI
 	attr uint16
 	aclc chan *aclData
+
+	// wmu keeps a payload's fragments together: notifications are written
+	// from several goroutines, and a fragment of one payload sent between
+	// those of another makes the central drop both.
+	wmu sync.Mutex
 }
 
 func newConn(hci *HCI, hh uint16) *conn {
@@ -60,6 +66,8 @@ func (c *conn) updateConnection() (int, error) {
 // It first prepend the l2cap header (4-bytes), and diassemble the payload
 // if it is larger than the HCI LE buffer size that the conntroller can support.
 func (c *conn) write(cid int, b []byte) (int, error) {
+	c.wmu.Lock()
+	defer c.wmu.Unlock()
 	flag := uint8(0) // ACL data continuation flag
 	tlen := len(b)   // Total length of the l2cap payload
 
