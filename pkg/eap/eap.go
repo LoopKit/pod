@@ -22,11 +22,13 @@ const (
 	CodeSuccess
 	CodeFailure
 
-	SubTypeAkaChallenge = 1
+	SubTypeAkaChallenge              = 1
+	SubTypeAkaSynchronizationFailure = 4
 
 	AT_RAND      AttributeType = 1
 	AT_AUTN      AttributeType = 2
 	AT_RES       AttributeType = 3
+	AT_AUTS      AttributeType = 4
 	AT_CUSTOM_IV AttributeType = 126
 )
 
@@ -54,9 +56,10 @@ type EapAkaChallenge struct {
 	amf  uint16
 	op   []byte
 
-	podIV []byte
-	pdmIV []byte
-	Sqn   uint64
+	podIV   []byte
+	pdmIV   []byte
+	Sqn     uint64 // the controller's, read from AUTN
+	lastSqn uint64 // the last one the pod accepted
 
 	identifier byte
 }
@@ -107,6 +110,10 @@ func Unmarshal(data []byte) (*EapAka, error) {
 
 			}
 			data = data[2:10] // 8 bytes
+		case AT_AUTS:
+			if len != 16 {
+				return nil, fmt.Errorf("invalid len received for attribute: %d -- %d", aType, len)
+			}
 		case AT_CUSTOM_IV:
 			if len != 8 {
 				return nil, fmt.Errorf("invalid len received for attribute: %d -- %d", len, aType)
@@ -162,6 +169,10 @@ func (e *EapAka) Marshal() ([]byte, error) {
 			buf.WriteByte(0)
 			buf.WriteByte(64) // RES len in bits
 			dataLen = 8
+		case AT_AUTS:
+			len = 4 // 4 * 4 = 16 bytes, no reserved bytes
+			buf.WriteByte(len)
+			dataLen = 14
 		case AT_CUSTOM_IV:
 			len = 2
 			buf.WriteByte(len)
@@ -180,17 +191,75 @@ func (e *EapAka) Marshal() ([]byte, error) {
 	return ret, nil
 }
 
-func NewEapAkaChallenge(k []byte, sqn uint64) *EapAkaChallenge {
+func NewEapAkaChallenge(k []byte, lastSqn uint64) *EapAkaChallenge {
 	op, _ := hex.DecodeString("cdc202d5123e20f62b6d676ac72cb318")
 	// amf, _ := hex.DecodeString("b9b9")
-	log.Debugf("Starting EAP-AKA session with SQN(after incrementing SQN): %d", sqn+1)
+	log.Debugf("Starting EAP-AKA session; last accepted SQN: %d", lastSqn)
 	return &EapAkaChallenge{
-		k:     k,
-		op:    op,
-		Sqn:   sqn + 1,
-		amf:   47545,                      // b9b9
-		podIV: []byte{0xa, 0xa, 0xa, 0xa}, // constant for now, easier to debug. TODO
+		k:       k,
+		op:      op,
+		lastSqn: lastSqn,
+		amf:     47545,                      // b9b9
+		podIV:   []byte{0xa, 0xa, 0xa, 0xa}, // constant for now, easier to debug. TODO
 	}
+}
+
+// CheckSqn reads the controller's SQN from AUTN (SQN xor AK || AMF || MAC-A) and
+// verifies MAC-A. It returns false when the SQN is not past the last one accepted,
+// which a pod answers with a synchronization failure.
+func (e *EapAkaChallenge) CheckSqn() (bool, error) {
+	if len(e.autn) != 16 || len(e.rand) != 16 {
+		return false, fmt.Errorf("missing RAND or AUTN")
+	}
+	_, _, _, ak, err := milenage.New(e.k, e.op, e.rand, 0, 0).F2345()
+	if err != nil {
+		return false, err
+	}
+	var sqn uint64
+	for i := 0; i < 6; i++ {
+		sqn = sqn<<8 | uint64(e.autn[i]^ak[i])
+	}
+	amf := uint16(e.autn[6])<<8 | uint16(e.autn[7])
+	mac, err := milenage.New(e.k, e.op, e.rand, sqn, amf).F1()
+	if err != nil {
+		return false, err
+	}
+	if !bytes.Equal(mac, e.autn[8:16]) {
+		return false, fmt.Errorf("AUTN MAC-A mismatch for SQN %d", sqn)
+	}
+	e.Sqn = sqn
+	return sqn > e.lastSqn, nil
+}
+
+// GenerateSynchronizationFailure answers a stale SQN with AUTS = SQN_ms xor AK* || MAC-S,
+// SQN_ms being the last SQN the pod accepted.
+func (e *EapAkaChallenge) GenerateSynchronizationFailure() (*message.Message, error) {
+	mil := milenage.New(e.k, e.op, e.rand, e.lastSqn, 0)
+	aks, err := mil.F5Star()
+	if err != nil {
+		return nil, err
+	}
+	macS, err := mil.F1Star(mil.SQN, []byte{0, 0})
+	if err != nil {
+		return nil, err
+	}
+	auts := make([]byte, 0, 14)
+	for i := 0; i < 6; i++ {
+		auts = append(auts, mil.SQN[i]^aks[i])
+	}
+	auts = append(auts, macS...)
+
+	eap := &EapAka{Code: CodeResponse,
+		Attributes: map[AttributeType]*Attribute{AT_AUTS: {Data: auts}},
+		SubType:    SubTypeAkaSynchronizationFailure,
+		Identifier: e.identifier,
+	}
+	ret := message.NewMessage(message.MessageTypeSessionEstablishment, e.podID, e.pdmID)
+	ret.Payload, err = eap.Marshal()
+	if err != nil {
+		return nil, err
+	}
+	return ret, nil
 }
 
 func (e *EapAkaChallenge) ParseChallenge(msg *message.Message) error {

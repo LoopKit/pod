@@ -183,7 +183,7 @@ func (p *Pod) StartActivation() {
 		log.Fatalf("pkg pod; could not get LTK %s", err)
 	}
 	log.Infof("pkg pod; LTK %x", p.state.LTK)
-	p.state.EapAkaSeq = 1
+	p.state.EapAkaSeq = 0 // the controller's first session uses SQN 1
 	p.state.Save()
 
 	p.EapAka()
@@ -191,19 +191,36 @@ func (p *Pod) StartActivation() {
 
 func (p *Pod) EapAka() {
 
-	session := eap.NewEapAkaChallenge(p.state.LTK, p.state.EapAkaSeq)
-
-	msg, ok := p.readSetup()
-	if !ok {
-		return
+	var session *eap.EapAkaChallenge
+	var msg *message.Message
+	var ok bool
+	for {
+		session = eap.NewEapAkaChallenge(p.state.LTK, p.state.EapAkaSeq)
+		if msg, ok = p.readSetup(); !ok {
+			return
+		}
+		if err := session.ParseChallenge(msg); err != nil {
+			p.startOver("error parsing the EAP-AKA challenge: %s", err)
+			return
+		}
+		fresh, err := session.CheckSqn()
+		if err != nil {
+			p.startOver("error checking the EAP-AKA challenge: %s", err)
+			return
+		}
+		if fresh {
+			break
+		}
+		// Another controller has had a session since this one's last: tell it our SQN.
+		// It retries on the same connection with the next one.
+		log.Infof("pkg pod; EAP-AKA SQN %d is not past %d; sending a synchronization failure", session.Sqn, p.state.EapAkaSeq)
+		if msg, err = session.GenerateSynchronizationFailure(); err != nil {
+			log.Fatalf("pkg pod; error generating the eap-aka synchronization failure: %s", err)
+		}
+		p.ble.WriteMessage(msg)
 	}
-	err := session.ParseChallenge(msg)
-	if err != nil {
-		p.startOver("error parsing the EAP-AKA challenge: %s", err)
-		return
-	}
 
-	msg, err = session.GenerateChallengeResponse()
+	msg, err := session.GenerateChallengeResponse()
 	if err != nil {
 		log.Fatalf("pkg pod; error generating the eap-aka challenge response")
 	}

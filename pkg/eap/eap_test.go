@@ -54,6 +54,18 @@ func TestEapAka_MarshalUnmarshal(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "synchronization failure",
+			eap: &EapAka{
+				Code:    CodeResponse,
+				SubType: SubTypeAkaSynchronizationFailure,
+				Attributes: map[AttributeType]*Attribute{
+					AT_AUTS: {
+						Data: make([]byte, 14),
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
