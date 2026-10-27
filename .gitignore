@@ -1,2 +1,3 @@
 /pod
 *.toml
+/scripts/ble-e2e/out/

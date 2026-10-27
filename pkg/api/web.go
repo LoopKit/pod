@@ -51,8 +51,9 @@ const indexHTML = `<!doctype html>
 </head>
 <body>
 <header>
-  <h1>DASH pod</h1>
+  <h1 id="title">Pod</h1>
   <span class="meta" id="podid"></span>
+  <span class="meta" id="controller"></span>
   <span class="chip" id="link" role="status">—</span>
 </header>
 <main>
@@ -132,6 +133,7 @@ const indexHTML = `<!doctype html>
       <tr><th scope="row">Nonce sequence</th><td id="nonceSeq">—</td></tr>
       <tr><th scope="row">EAP-AKA sequence</th><td id="eapSeq">—</td></tr>
       <tr><th scope="row">Last programming sequence</th><td id="progSeq">—</td></tr>
+      <tr id="sigRow" hidden><th scope="row">Signed commands rejected</th><td id="badSigs">—</td></tr>
     </tbody></table>
   </section>
   <div class="muted" id="msg" role="status" aria-live="polite"></div>
@@ -303,7 +305,12 @@ function chip(el, text, cls){ el.textContent=text; el.className='chip '+(cls||''
 
 function show(s){
   last = s;
+  document.title = s.modeName+' simulator';
+  $('title').textContent = s.modeName+' pod';
   $('podid').textContent = s.id ? 'id '+s.id : (s.paired ? '' : 'not paired');
+  $('controller').textContent = s.controllerId ? 'controller '+s.controllerId : '';
+  $('sigRow').hidden = s.mode !== 'o5';
+  $('badSigs').textContent = s.badSignatures;
   chip($('link'), s.connected ? 'connected' : 'not connected', s.connected ? 'ok' : '');
   $('reservoir').textContent = Math.round(s.reservoir*100)/100;
   const p = s.fault ? ['bad'] : s.progress>=8 && s.progress<=9 ? ['ok'] : ['warn'];

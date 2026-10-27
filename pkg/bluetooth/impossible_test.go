@@ -11,6 +11,8 @@ import (
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/avereha/pod/pkg/mode"
 )
 
 type fakeApp struct {
@@ -51,7 +53,7 @@ func TestSimRadioPairsAndCarriesBothCharacteristics(t *testing.T) {
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "impossible.sock")
 	const id = "11111111-2222-4333-8444-555555555555"
-	b, err := New(func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil) })
+	b, err := New(mode.Dash, func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil, 0) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -139,6 +141,67 @@ func TestSimRadioPairsAndCarriesBothCharacteristics(t *testing.T) {
 	}
 }
 
+// An Omnipod 5 pod in the Simulator advertises the single O5 UUID, serves
+// the 2443 data characteristic, and once paired advertises the phone's id.
+func TestSimRadioServesAnOmnipod5(t *testing.T) {
+	dir, err := ioutil.TempDir("/tmp", "podsim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "impossible.sock")
+	const id = "11111111-2222-4333-8444-555555555555"
+	b, err := New(mode.O5, func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil, 0) })
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	app := &fakeApp{t: t, conn: conn, in: bufio.NewScanner(conn)}
+
+	app.send(map[string]interface{}{"type": "hello", "bundleId": "org.loopkit.Loop", "pid": 0})
+	app.send(map[string]interface{}{"type": "scan"})
+	adv := app.expect("didDiscover")["adv"].(map[string]interface{})
+	uuids := adv["kCBAdvDataServiceUUIDs"].([]interface{})
+	if len(uuids) != 1 || uuids[0] != "CE1F923D-C539-48EA-7300-0AFFFFFFFE00" {
+		t.Fatalf("an unpaired Omnipod 5 advertises %v", uuids)
+	}
+
+	app.send(map[string]interface{}{"type": "connect", "id": id})
+	app.expect("didConnect")
+	app.send(map[string]interface{}{"type": "discoverServices", "id": id})
+	svc := app.expect("didDiscoverServices")["services"].([]interface{})[0].(map[string]interface{})
+	app.send(map[string]interface{}{"type": "discoverCharacteristics", "id": id, "serviceId": svc["id"]})
+	chars := app.expect("didDiscoverCharacteristics")["characteristics"].([]interface{})
+	if len(chars) != 2 || chars[1].(map[string]interface{})["uuid"] != "1A7E2443-E3ED-4464-8B7E-751E03D0DC5F" {
+		t.Fatalf("characteristics %v", chars)
+	}
+	dataChar := chars[1].(map[string]interface{})["id"]
+	app.send(map[string]interface{}{"type": "write", "id": id, "characteristicId": dataChar, "writeType": 1,
+		"value": base64.StdEncoding.EncodeToString([]byte{0, 1, 2})})
+	if p, _ := b.ReadData(); string(p) != "\x00\x01\x02" {
+		t.Fatalf("data characteristic carried %x", p)
+	}
+
+	if err := b.RefreshAdvertisingWithSpecifiedId([]byte{0x00, 0x2a, 0x1c, 0x6c}); err != nil {
+		t.Fatal(err)
+	}
+	b.ShutdownConnection()
+	app.expect("didDisconnect")
+	uuids = app.expect("didDiscover")["adv"].(map[string]interface{})["kCBAdvDataServiceUUIDs"].([]interface{})
+	if len(uuids) != 1 || uuids[0] != "CE1F923D-C539-48EA-7300-0A002A1C6C00" {
+		t.Fatalf("a paired Omnipod 5 advertises %v", uuids)
+	}
+	b.SetAdvertisedState(AdvertState{Fault: 0x14})
+	uuids = app.expect("didDiscover")["adv"].(map[string]interface{})["kCBAdvDataServiceUUIDs"].([]interface{})
+	if len(uuids) != 1 || uuids[0] != "CE1F923D-C539-48EA-7300-0A002A1C6C02" {
+		t.Fatalf("a faulted Omnipod 5 advertises %v", uuids)
+	}
+}
+
 func TestSimRadioHoldsAConnectForItsStartDelay(t *testing.T) {
 	dir, err := ioutil.TempDir("/tmp", "podsim")
 	if err != nil {
@@ -147,7 +210,7 @@ func TestSimRadioHoldsAConnectForItsStartDelay(t *testing.T) {
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "impossible.sock")
 	const id = "11111111-2222-4333-8444-555555555555"
-	b, err := New(func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil) })
+	b, err := New(mode.Dash, func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil, 0) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -180,5 +243,37 @@ func TestSimRadioHoldsAConnectForItsStartDelay(t *testing.T) {
 	time.Sleep(400 * time.Millisecond)
 	if b.IsConnected() {
 		t.Fatal("a cancelled connect completed")
+	}
+}
+
+// With an MTU, the pod gives it to the app on connecting, for ImpossiBLE to
+// cut writes as CoreBluetooth would; without one it gives none.
+func TestSimRadioGivesItsMTUOnConnecting(t *testing.T) {
+	for _, mtu := range []int{0, 185} {
+		dir, err := ioutil.TempDir("/tmp", "podsim")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.RemoveAll(dir)
+		path := filepath.Join(dir, "impossible.sock")
+		const id = "11111111-2222-4333-8444-555555555555"
+		if _, err := New(mode.O5, func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil, mtu) }); err != nil {
+			t.Fatal(err)
+		}
+		conn, err := net.Dial("unix", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		app := &fakeApp{t: t, conn: conn, in: bufio.NewScanner(conn)}
+		app.send(map[string]interface{}{"type": "hello", "bundleId": "org.nightscout.Trio", "pid": 0})
+		app.send(map[string]interface{}{"type": "connect", "id": id})
+		got, given := app.expect("didConnect")["mtu"]
+		if mtu == 0 && given {
+			t.Errorf("no MTU set, but the app was given %v", got)
+		}
+		if mtu != 0 && got != float64(mtu) {
+			t.Errorf("MTU %d set, the app was given %v", mtu, got)
+		}
 	}
 }

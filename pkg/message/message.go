@@ -14,8 +14,17 @@ const (
 	MessageTypeEncrypted
 	MessageTypeSessionEstablishment
 	MessageTypePairing
+	// MessageTypeEncryptedSigned is an Omnipod 5 command the phone signs:
+	// the same AES-CCM payload as MessageTypeEncrypted followed by a 64-byte
+	// ECDSA signature over the 16-byte header and the ciphertext with its
+	// tag. The header's length counts the plaintext only, as for
+	// MessageTypeEncrypted (OmnipodKit MessagePacket.swift).
+	MessageTypeEncryptedSigned
 	MagicPattern = "TW"
 )
+
+// SignatureSize is the raw r||s P-256 signature on a MessageTypeEncryptedSigned.
+const SignatureSize = 64
 
 // Message is one CTwiPacket
 type Message struct {
@@ -35,16 +44,20 @@ type Message struct {
 	SequenceNumber   uint8
 	AckNumber        uint8
 	Version          uint16
+
+	// Signature is the phone's signature on a MessageTypeEncryptedSigned.
+	Signature []byte
 }
 
 type flag byte
 
 func (f *flag) set(index byte, val bool) {
 	var mask flag = 1 << (7 - index)
-	if !val {
-		return
+	if val {
+		*f |= mask
+	} else {
+		*f &^= mask
 	}
-	*f |= mask
 }
 
 func (f flag) get(index byte) byte {
@@ -67,9 +80,15 @@ func NewMessage(t MessageType, source, destination []byte) *Message {
 	return msg
 }
 
+// HasTag says whether the payload ends in an AES-CCM tag that the header's
+// length does not count.
+func (m *Message) HasTag() bool {
+	return m.Type == MessageTypeEncrypted || m.Type == MessageTypeEncryptedSigned
+}
+
 func (m *Message) Marshal() ([]byte, error) {
 	var buf bytes.Buffer
-	if m.Type == MessageTypeEncrypted && m.EncryptedPayload { // Already encrypted
+	if m.HasTag() && m.EncryptedPayload { // Already encrypted
 		return m.Raw, nil
 	}
 
@@ -103,6 +122,8 @@ func (m *Message) Marshal() ([]byte, error) {
 	if m.Payload != nil {
 		l = uint16(len(m.Payload))
 	}
+	// 11-bit length: the high 8 bits, then the low 3 bits in the top of the
+	// next byte.
 	buf.WriteByte(byte(l >> 3))
 	buf.WriteByte(byte(l << 5))
 
@@ -143,7 +164,7 @@ func Unmarshal(data []byte) (*Message, error) {
 	ret.Gateway = f.get(3) == 1
 	ret.Type = MessageType(f.get(7) | f.get(6)<<1 | f.get(5)<<2 | f.get(4)<<3)
 
-	if ret.Type > MessageTypePairing {
+	if ret.Type > MessageTypeEncryptedSigned {
 		return nil, fmt.Errorf("invalid message type found in %x", data)
 	}
 	if ret.Version != 0 {
@@ -151,17 +172,31 @@ func Unmarshal(data []byte) (*Message, error) {
 	}
 	ret.SequenceNumber = data[4]
 	ret.AckNumber = data[5]
-	var n = data[6]<<3 | data[7]>>5
-	if int(n) > len(data)-16 {
+	// Widen before shifting: a byte shift would drop the high bits of any
+	// length over 255 (the Omnipod 5 SPS2.1 and SPS2 messages).
+	n := int(data[6])<<3 | int(data[7])>>5
+	if n > len(data)-16 {
 		spew.Dump(ret)
 		return nil, fmt.Errorf("received length is too big in %x. Length:%d . remaining: %d", data, n, len(data)-16)
 	}
 	ret.Source = data[8:12]
 	ret.Destination = data[12:16]
-	if ret.Type == MessageTypeEncrypted {
+	switch ret.Type {
+	case MessageTypeEncrypted:
+		if 16+n+8 > len(data) {
+			return nil, fmt.Errorf("encrypted message %x is missing its tag", data)
+		}
 		ret.Payload = data[16 : 16+n+8]
 		ret.EncryptedPayload = true
-	} else {
+	case MessageTypeEncryptedSigned:
+		end := 16 + n + 8
+		if end+SignatureSize > len(data) {
+			return nil, fmt.Errorf("signed message %x is missing its tag or signature", data)
+		}
+		ret.Payload = data[16:end]
+		ret.Signature = data[end : end+SignatureSize]
+		ret.EncryptedPayload = true
+	default:
 		ret.Payload = data[16 : 16+n]
 	}
 	return ret, nil

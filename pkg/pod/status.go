@@ -26,6 +26,9 @@ var progressNames = map[response.PodProgress]string{
 
 // Status is the pod as the control panel shows it.
 type Status struct {
+	Mode                string    `json:"mode"`
+	ModeName            string    `json:"modeName"`
+	ControllerID        string    `json:"controllerId"`
 	ID                  string    `json:"id"`
 	Paired              bool      `json:"paired"`
 	Connected           bool      `json:"connected"`
@@ -50,11 +53,13 @@ type Status struct {
 	NonceSeq            uint64    `json:"nonceSeq"`
 	EapAkaSeq           uint64    `json:"eapAkaSeq"`
 	LastProgSeqNum      uint8     `json:"lastProgSeqNum"`
+	BadSignatures       int       `json:"badSignatures"`
 }
 
 func (p *Pod) takeSnapshot() {
 	p.snapMtx.Lock()
 	p.snapshot = *p.state
+	p.snapshotBadSignatures = p.badSignatures
 	p.snapMtx.Unlock()
 	p.ble.SetAdvertisedState(bluetooth.AdvertState{Fault: p.state.FaultEvent, Alerts: p.state.ActiveAlertSlots})
 }
@@ -63,6 +68,7 @@ func (p *Pod) takeSnapshot() {
 func (p *Pod) Status() Status {
 	p.snapMtx.Lock()
 	s := p.snapshot
+	badSignatures := p.snapshotBadSignatures
 	crash := ""
 	if crashBeforeProcessingCommand {
 		crash = "before"
@@ -80,7 +86,14 @@ func (p *Pod) Status() Status {
 	if len(s.Id) == 4 {
 		id = fmt.Sprintf("%08X", s.Id)
 	}
+	controller := ""
+	if len(s.ControllerID) == 4 {
+		controller = fmt.Sprintf("%08X", s.ControllerID)
+	}
 	return Status{
+		Mode:                s.Mode.String(),
+		ModeName:            s.Mode.Describe(),
+		ControllerID:        controller,
 		ID:                  id,
 		Paired:              s.LTK != nil,
 		Connected:           p.ble.IsConnected(),
@@ -105,5 +118,6 @@ func (p *Pod) Status() Status {
 		NonceSeq:            s.NonceSeq,
 		EapAkaSeq:           s.EapAkaSeq,
 		LastProgSeqNum:      s.LastProgSeqNum,
+		BadSignatures:       badSignatures,
 	}
 }

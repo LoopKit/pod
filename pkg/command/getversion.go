@@ -28,8 +28,10 @@ func (g *GetVersion) GetSeq() uint8 {
 	return g.Seq
 }
 
+// IsResponseHardcoded is false: the version response names the pod the
+// simulator plays.
 func (g *GetVersion) IsResponseHardcoded() bool {
-	return true
+	return false
 }
 
 func (g *GetVersion) DoesMutatePodState() bool {
@@ -37,8 +39,7 @@ func (g *GetVersion) DoesMutatePodState() bool {
 }
 
 func (g *GetVersion) GetResponse() (response.Response, error) {
-	// TODO improve responses
-	return &response.VersionResponse{}, nil
+	return response.AssignAddressResponse(""), nil
 }
 
 func (g *GetVersion) SetHeaderData(seq uint8, id []byte) error {

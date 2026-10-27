@@ -24,8 +24,10 @@ func (g *SetUniqueID) GetSeq() uint8 {
 	return g.Seq
 }
 
+// IsResponseHardcoded is false: the version response names the pod the
+// simulator plays and carries the id this command set.
 func (g *SetUniqueID) IsResponseHardcoded() bool {
-	return true
+	return false
 }
 
 func (g *SetUniqueID) DoesMutatePodState() bool {
@@ -33,8 +35,7 @@ func (g *SetUniqueID) DoesMutatePodState() bool {
 }
 
 func (g *SetUniqueID) GetResponse() (response.Response, error) {
-	// TODO improve responses
-	return &response.SetUniqueID{}, nil
+	return response.SetupPodResponse("", g.Payload), nil
 }
 
 func (g *SetUniqueID) SetHeaderData(seq uint8, id []byte) error {

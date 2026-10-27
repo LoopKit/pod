@@ -4,6 +4,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sync"
+	"time"
 
 	"github.com/paypal/gatt"
 	"github.com/paypal/gatt/linux/cmd"
@@ -12,11 +13,12 @@ import (
 
 // gattRadio serves the pod from a Linux Bluetooth adapter.
 type gattRadio struct {
+	ble     *Ble
 	device  gatt.Device
 	central gatt.Central
 
 	advertMtx sync.Mutex
-	podId     []byte
+	id        []byte
 	state     AdvertState
 
 	cmdNotifier    gatt.Notifier
@@ -24,6 +26,9 @@ type gattRadio struct {
 
 	dataNotifier    gatt.Notifier
 	dataNotifierMtx sync.Mutex
+
+	mtuMtx sync.Mutex
+	mtu    int // the ATT MTU last reported for this connection
 }
 
 var DefaultServerOptions = []gatt.Option{
@@ -36,18 +41,25 @@ var DefaultServerOptions = []gatt.Option{
 	}),
 }
 
-// NewGattRadio serves the pod from the first Bluetooth adapter.
-func NewGattRadio(b *Ble, podId []byte) (Radio, error) {
+// NewGattRadio serves the pod from the first Bluetooth adapter, advertising
+// id (see Radio.Advertise).
+func NewGattRadio(b *Ble, id []byte) (Radio, error) {
 	d, err := gatt.NewDevice(DefaultServerOptions...)
 	if err != nil {
 		log.Fatalf("pkg bluetooth; failed to open device, err: %s", err)
 	}
-	r := &gattRadio{device: d, podId: podId}
+	r := &gattRadio{ble: b, device: d, id: id}
 
 	d.Handle(
 		gatt.CentralConnected(func(c gatt.Central) {
 			fmt.Println("pkg bluetooth; ** New connection from: ", c.ID())
 			r.central = c
+			r.mtuMtx.Lock()
+			r.mtu = 0
+			r.mtuMtx.Unlock()
+			if b.Mode().IsO5() {
+				go r.raiseMTU(c)
+			}
 			b.Connected()
 		}),
 		gatt.CentralDisconnected(func(c gatt.Central) {
@@ -61,13 +73,9 @@ func NewGattRadio(b *Ble, podId []byte) (Radio, error) {
 		fmt.Printf("state: %s\n", s)
 		switch s {
 		case gatt.StatePoweredOn:
-			var serviceUUID = gatt.MustParseUUID("1a7e-4024-e3ed-4464-8b7e-751e03d0dc5f")
-			var cmdCharUUID = gatt.MustParseUUID("1a7e-2441-e3ed-4464-8b7e-751e03d0dc5f")
-			var dataCharUUID = gatt.MustParseUUID("1a7e-2442-e3ed-4464-8b7e-751e03d0dc5f")
+			s := gatt.NewService(gatt.MustParseUUID(podServiceUUID))
 
-			s := gatt.NewService(serviceUUID)
-
-			cmdCharacteristic := s.AddCharacteristic(cmdCharUUID)
+			cmdCharacteristic := s.AddCharacteristic(gatt.MustParseUUID(cmdCharUUID))
 			cmdCharacteristic.HandleWriteFunc(
 				func(r gatt.Request, data []byte) (status byte) {
 					log.Tracef("received CMD,  %x", data)
@@ -83,19 +91,21 @@ func NewGattRadio(b *Ble, podId []byte) (Radio, error) {
 					log.Infof("pkg bluetooth; handling CMD notifications on new connection from:  %s", req.Central.ID())
 				})
 
-			dataCharacteristic := s.AddCharacteristic(dataCharUUID)
+			dataCharacteristic := s.AddCharacteristic(gatt.MustParseUUID(DataCharUUID(b.Mode())))
 			dataCharacteristic.HandleNotifyFunc(
 				func(req gatt.Request, n gatt.Notifier) {
 					r.dataNotifierMtx.Lock()
 					r.dataNotifier = n
 					r.dataNotifierMtx.Unlock()
 					log.Infof("pkg bluetooth; handling DATA notifications on new connection from: %s", req.Central.ID())
+					r.reportMTU(req.Central)
 					log.Infof("     *** OK to send commands from the phone app ***")
 				})
 
 			dataCharacteristic.HandleWriteFunc(
-				func(r gatt.Request, data []byte) (status byte) {
+				func(req gatt.Request, data []byte) (status byte) {
 					log.Tracef("pkg bluetooth; received DATA,%x, -- %d", data, len(data))
+					r.reportMTU(req.Central)
 					b.DataWritten(data)
 					return 0
 				})
@@ -118,22 +128,77 @@ func NewGattRadio(b *Ble, podId []byte) (Radio, error) {
 	return r, nil
 }
 
+// reportMTU logs the ATT MTU the phone negotiated when it changes on this
+// connection. The phone proposes it and paypal/gatt accepts up to 256, so
+// the pod cannot raise it; an Omnipod 5 needs 247 for its 244-byte packets,
+// and below that the phone's longer messages never arrive whole.
+func (r *gattRadio) reportMTU(c gatt.Central) {
+	mtu := c.MTU()
+	r.mtuMtx.Lock()
+	changed := mtu != r.mtu
+	r.mtu = mtu
+	r.mtuMtx.Unlock()
+	if !changed {
+		return
+	}
+	if need := r.ble.MinMTU(); mtu < need {
+		log.Warnf("pkg bluetooth; the phone negotiated an ATT MTU of %d, but an %s pod's packets need %d: messages longer than one packet will not get through",
+			mtu, r.ble.Mode().Describe(), need)
+		return
+	}
+	log.Infof("pkg bluetooth; the phone negotiated an ATT MTU of %d", mtu)
+}
+
+// podRxMTU is the largest ATT MTU paypal/gatt takes (handleMTU).
+const podRxMTU = 256
+
+// raiseMTU asks the phone for a larger ATT MTU when the one it offered is
+// too small for the pod's packets (an iPhone has offered 185 where an
+// Omnipod 5 needs 247). iOS starts its own exchange as it connects; the pod
+// waits for it, as one handled after the pod's would lower the MTU again,
+// then starts an exchange of its own, which the phone answers with its Rx
+// MTU. reportMTU logs the outcome.
+func (r *gattRadio) raiseMTU(c gatt.Central) {
+	for i := 0; i < 50 && c.MTU() == 23; i++ { // up to 1 s
+		time.Sleep(20 * time.Millisecond)
+	}
+	mtu := c.MTU()
+	if mtu >= r.ble.MinMTU() {
+		return
+	}
+	asker, ok := c.(interface{ RequestMTU(int) error })
+	if !ok {
+		return
+	}
+	log.Infof("pkg bluetooth; the phone offered an ATT MTU of %d; asking it for %d", mtu, podRxMTU)
+	if err := asker.RequestMTU(podRxMTU); err != nil {
+		log.Warnf("pkg bluetooth; could not ask the phone for a larger ATT MTU: %s", err)
+	}
+}
+
 func (r *gattRadio) advertise() error {
 	r.advertMtx.Lock()
-	podId, state := r.podId, r.state
+	id, state := r.id, r.state
 	r.advertMtx.Unlock()
-	// paypal/gatt advertises no manufacturer data.
+	m := r.ble.Mode()
 	var uuids []gatt.UUID
-	for _, u := range AdvertisedServices(podId, state) {
-		uuids = append(uuids, gatt.UUID16(u))
+	for _, u := range AdvertisedServices(m, id, state) {
+		uuids = append(uuids, gatt.MustParseUUID(u.String()))
 	}
-	return r.device.AdvertiseNameAndServices(AdvertisedName, uuids)
+	if m.IsO5() {
+		// The 128-bit UUID and the manufacturer data fit the 31 bytes; the
+		// name goes in the scan response.
+		return r.device.AdvertiseNameServicesMfgData(AdvertisedName(m, id), uuids, ManufacturerData(m, state))
+	}
+	// A DASH pod's nine UUIDs fill the packet; paypal/gatt advertises no
+	// manufacturer data for it.
+	return r.device.AdvertiseNameAndServices(AdvertisedName(m, id), uuids)
 }
 
 // Advertise updates the advertisement; paypal/gatt needs no StopAdvertising first.
-func (r *gattRadio) Advertise(podId []byte) error {
+func (r *gattRadio) Advertise(id []byte) error {
 	r.advertMtx.Lock()
-	r.podId = podId
+	r.id = id
 	r.advertMtx.Unlock()
 	err := r.advertise()
 	if err != nil {

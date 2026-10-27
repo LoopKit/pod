@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/avereha/pod/pkg/aid"
 	"github.com/avereha/pod/pkg/bluetooth"
 	"github.com/avereha/pod/pkg/command"
 	"github.com/avereha/pod/pkg/eap"
@@ -36,10 +37,16 @@ type Pod struct {
 	mtx            sync.Mutex
 	webMessageHook func([]byte)
 
+	// aid holds what an Omnipod 5 phone set with its AID setup commands.
+	aid aid.Settings
+	// badSignatures counts commands refused for want of a valid signature.
+	badSignatures int
+
 	// snapshot is the state as of the last completed command, for the
 	// status page: mtx is held while a command waits for the phone's ACK.
-	snapMtx  sync.Mutex
-	snapshot PODState
+	snapMtx               sync.Mutex
+	snapshot              PODState
+	snapshotBadSignatures int
 }
 
 // Once one of these are set, the next command will crash the executable.
@@ -50,9 +57,41 @@ func New(ble *bluetooth.Ble, state *PODState) *Pod {
 	ret := &Pod{
 		ble:   ble,
 		state: state,
+		aid:   aid.Settings{},
 	}
 	ret.takeSnapshot()
 	return ret
+}
+
+// advertisedID is the id the pod puts in its advertisement: its own for a
+// DASH pod, the phone's for an Omnipod 5 (OmnipodKit setUuidPdmId).
+func (p *Pod) advertisedID() []byte {
+	if p.state.Mode.IsO5() {
+		return p.state.ControllerID
+	}
+	return p.state.Id
+}
+
+// helloControllerID reads the phone's id from its HELLO, 06 01 04 and the id.
+func helloControllerID(cmd bluetooth.Packet) []byte {
+	if len(cmd) == 7 && cmd[0] == 0x06 && cmd[1] == 0x01 && cmd[2] == 0x04 {
+		return append([]byte(nil), cmd[3:7]...)
+	}
+	return nil
+}
+
+// identity is an Omnipod 5 pod's signing key and certificate, made once.
+func (p *Pod) identity() (*pair.PodIdentity, error) {
+	if id, err := pair.LoadPodIdentity(p.state.O5PrivateKey, p.state.O5CertDER); err == nil {
+		return id, nil
+	}
+	id, err := pair.NewPodIdentity()
+	if err != nil {
+		return nil, err
+	}
+	p.state.O5PrivateKey = id.Private()
+	p.state.O5CertDER = id.CertDER
+	return id, p.state.Save()
 }
 
 func (p *Pod) SetWebMessageHook(hook func([]byte)) {
@@ -84,6 +123,10 @@ func (p *Pod) StartAcceptingCommands() {
 	log.Infof("pkg pod; Listening for commands")
 	firstCmd, _ := p.ble.ReadCmd()
 	log.Infof("pkg pod; got first command: as string: %s", firstCmd)
+	if id := helloControllerID(firstCmd); id != nil {
+		log.Infof("pkg pod; HELLO from controller %x", id)
+		p.state.ControllerID = id
+	}
 
 	p.ble.StartMessageLoop()
 
@@ -118,9 +161,20 @@ func (p *Pod) startOver(format string, args ...interface{}) {
 	go p.StartAcceptingCommands()
 }
 
+// StartActivation pairs with the phone: SP1/SP2, SPS1, SPS2, SP0/GP0 for a
+// DASH pod; an Omnipod 5 adds SPS0 after SP1/SP2 and SPS2.1 before SPS2
+// (OmnipodKit DashLTKExchanger, O5LTKExchanger).
 func (p *Pod) StartActivation() {
 
-	pair := &pair.Pair{}
+	o5 := p.state.Mode.IsO5()
+	pair := &pair.Pair{Mode: p.state.Mode}
+	if o5 {
+		id, err := p.identity()
+		if err != nil {
+			log.Fatalf("pkg pod; no pod identity: %s", err)
+		}
+		pair.SetIdentity(id)
+	}
 	msg, ok := p.readSetup()
 	if !ok {
 		return
@@ -129,6 +183,25 @@ func (p *Pod) StartActivation() {
 		p.startOver("error parsing SP1SP2 %s", err)
 		return
 	}
+	if p.state.ControllerID == nil {
+		p.state.ControllerID = pair.ControllerID()
+	}
+
+	if o5 {
+		if msg, ok = p.readSetup(); !ok {
+			return
+		}
+		if err := pair.ParseSPS0(msg); err != nil {
+			p.startOver("error parsing SPS0 %s", err)
+			return
+		}
+		msg, err := pair.GenerateSPS0()
+		if err != nil {
+			log.Fatal(err)
+		}
+		p.ble.WriteMessage(msg)
+	}
+
 	// read PDM public key and nonce
 	if msg, ok = p.readSetup(); !ok {
 		return
@@ -145,7 +218,23 @@ func (p *Pod) StartActivation() {
 	// send POD public key and nonce
 	p.ble.WriteMessage(msg)
 
-	// read PDM conf value
+	if o5 {
+		// the phone's certificate, then the pod's
+		if msg, ok = p.readSetup(); !ok {
+			return
+		}
+		if err := pair.ParseSPS21(msg); err != nil {
+			p.startOver("error parsing SPS2.1 %s", err)
+			return
+		}
+		msg, err = pair.GenerateSPS21()
+		if err != nil {
+			log.Fatal(err)
+		}
+		p.ble.WriteMessage(msg)
+	}
+
+	// read PDM conf value (DASH) or its certificate and signature (Omnipod 5)
 	if msg, ok = p.readSetup(); !ok {
 		return
 	}
@@ -183,6 +272,10 @@ func (p *Pod) StartActivation() {
 		log.Fatalf("pkg pod; could not get LTK %s", err)
 	}
 	log.Infof("pkg pod; LTK %x", p.state.LTK)
+	if key := pair.PDMPublicKey(); key != nil {
+		p.state.PDMPublicKey = key
+		log.Infof("pkg pod; keeping the phone's signing key for its signed commands")
+	}
 	p.state.EapAkaSeq = 0 // the controller's first session uses SQN 1
 	p.state.Save()
 
@@ -266,6 +359,7 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 	var lastMsgSeq uint8 = 0
 	var data []byte = make([]byte, 4)
 	var n int = 0
+	o5 := p.state.Mode.IsO5()
 	for {
 		if pMsg.DeactivateFlag {
 			log.Infof("pkg pod; Pod was deactivated. Use -fresh for new pod")
@@ -304,6 +398,14 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		// Lock mutex before we start using/modifying state
 		p.mtx.Lock()
 
+		// An Omnipod 5 phone signs its insulin, cancel and deactivate
+		// commands (type 4): the signature covers the header and the
+		// ciphertext, so it is checked before decrypting.
+		signed := false
+		if msg.Type == message.MessageTypeEncryptedSigned {
+			signed = p.verifySignature(msg)
+		}
+
 		decrypted, err := encrypt.DecryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, msg)
 		if err != nil {
 			p.mtx.Unlock()
@@ -312,89 +414,113 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		}
 		p.state.NonceSeq++
 
-		if len(decrypted.Payload) < 16 {
-			p.mtx.Unlock()
-			p.startOver("decrypted payload too short: %x", decrypted.Payload)
-			return
-		}
-		cmd, err := command.Unmarshal(decrypted.Payload)
-		if err != nil {
-			p.mtx.Unlock()
-			p.startOver("could not unmarshal command: %s", err)
-			return
-		}
-		cmdSeq, requestID, err := cmd.GetHeaderData()
-		if err != nil {
-			p.mtx.Unlock()
-			p.startOver("could not get command header data: %s", err)
-			return
-		}
-		p.state.CmdSeq = cmdSeq
-
-		log.Debugf("pkd pod; cmd: %x", decrypted.Payload)
-		data = decrypted.Payload
-		n = len(data)
-		log.Debugf("pkg pod; len = %d", n)
-		pMsg.MsgBodyCommand = data[13 : n-5]
-		if data[13] == 0x1c {
-			pMsg.DeactivateFlag = true
-		}
-		log.Tracef("pkg pod; command pod message body = %x", pMsg.MsgBodyCommand)
-
-		p.handleCommand(cmd)
-
-		var rsp response.Response
-		if cmd.IsResponseHardcoded() {
-			rsp, err = cmd.GetResponse()
+		var reply *message.Message
+		if o5 && aid.IsCommand(decrypted.Payload) {
+			// An Omnipod 5 AID setup command, between AssignAddress and
+			// SetupPod. It is plain text, answered in plain text, and
+			// does not count as an Omnipod command.
+			reply, err = p.answerAID(msg, decrypted.Payload)
 			if err != nil {
-				log.Fatalf("pkg pod; could not get command response: %s", err)
+				p.mtx.Unlock()
+				p.startOver("%s", err)
+				return
 			}
 		} else {
-			rsp = p.getResponse(cmd)
-		}
+			if len(decrypted.Payload) < 16 {
+				p.mtx.Unlock()
+				p.startOver("decrypted payload too short: %x", decrypted.Payload)
+				return
+			}
+			cmd, err := command.Unmarshal(decrypted.Payload)
+			if err != nil {
+				p.mtx.Unlock()
+				p.startOver("could not unmarshal command: %s", err)
+				return
+			}
+			cmdSeq, requestID, err := cmd.GetHeaderData()
+			if err != nil {
+				p.mtx.Unlock()
+				p.startOver("could not get command header data: %s", err)
+				return
+			}
+			p.state.CmdSeq = cmdSeq
 
-		if cmd.GetType() == command.SET_UNIQUE_ID {
-			// Set the unique ID
-			log.Tracef("SET_UNIQUE_ID cmd.GetPayload() %x", cmd.GetPayload())
-			uniqueId := cmd.GetPayload()
-			log.Tracef("SET_UNIQUE_ID uniqueId %x", uniqueId)
-			p.ble.RefreshAdvertisingWithSpecifiedId(uniqueId)
-			p.state.Id = uniqueId
-		}
+			log.Debugf("pkd pod; cmd: %x", decrypted.Payload)
+			data = decrypted.Payload
+			n = len(data)
+			log.Debugf("pkg pod; len = %d", n)
+			pMsg.MsgBodyCommand = data[13 : n-5]
+			log.Tracef("pkg pod; command pod message body = %x", pMsg.MsgBodyCommand)
 
-		switch c := cmd.(type) {
-		case *command.StopDelivery:
-			// Need to clear BolusEnd *after* response is generated, as it is used
-			// to calculate remaining
-			if c.StopBolus {
-				p.state.BolusEnd = time.Time{}
+			var rsp response.Response
+			if o5 && command.RequiresSignature(cmd.GetType()) && !signed {
+				// A real Omnipod 5 refuses the command rather than run it.
+				log.Errorf("pkg pod; %s was not validly signed; answering error 0x%02X", command.CommandName[cmd.GetType()], response.ErrorO5InvalidCommand)
+				if msg.Type != message.MessageTypeEncryptedSigned {
+					p.badSignatures++ // verifySignature counted a bad one already
+				}
+				rsp = &response.ErrorResponse{Code: response.ErrorO5InvalidCommand, FaultEvent: p.state.FaultEvent, PodProgress: p.state.PodProgress}
+			} else {
+				if data[13] == 0x1c {
+					pMsg.DeactivateFlag = true
+				}
+
+				p.handleCommand(cmd)
+
+				if cmd.IsResponseHardcoded() {
+					rsp, err = cmd.GetResponse()
+					if err != nil {
+						log.Fatalf("pkg pod; could not get command response: %s", err)
+					}
+				} else {
+					rsp = p.getResponse(cmd)
+				}
+
+				if cmd.GetType() == command.SET_UNIQUE_ID {
+					// Set the unique ID
+					log.Tracef("SET_UNIQUE_ID cmd.GetPayload() %x", cmd.GetPayload())
+					uniqueId := cmd.GetPayload()
+					log.Tracef("SET_UNIQUE_ID uniqueId %x", uniqueId)
+					p.state.Id = uniqueId
+					p.ble.RefreshAdvertisingWithSpecifiedId(p.advertisedID())
+				}
+
+				switch c := cmd.(type) {
+				case *command.StopDelivery:
+					// Need to clear BolusEnd *after* response is generated, as it is used
+					// to calculate remaining
+					if c.StopBolus {
+						p.state.BolusEnd = time.Time{}
+					}
+				}
+			}
+
+			p.state.MsgSeq++
+			p.state.CmdSeq++
+			p.state.Save()
+			responseMetadata := &response.ResponseMetadata{
+				Dst:       msg.Source,
+				Src:       msg.Destination,
+				CmdSeq:    p.state.CmdSeq,
+				MsgSeq:    p.state.MsgSeq,
+				RequestID: requestID,
+				AckSeq:    msg.SequenceNumber + 1,
+				Mode:      p.state.Mode,
+			}
+			reply, err = response.Marshal(rsp, responseMetadata)
+			if err != nil {
+				log.Fatalf("pkg pod; could not marshal command response: %s", err)
 			}
 		}
-
-		p.state.MsgSeq++
-		p.state.CmdSeq++
-		p.state.Save()
-		responseMetadata := &response.ResponseMetadata{
-			Dst:       msg.Source,
-			Src:       msg.Destination,
-			CmdSeq:    p.state.CmdSeq,
-			MsgSeq:    p.state.MsgSeq,
-			RequestID: requestID,
-			AckSeq:    msg.SequenceNumber + 1,
-		}
-		msg, err = response.Marshal(rsp, responseMetadata)
-		if err != nil {
-			log.Fatalf("pkg pod; could not marshal command response: %s", err)
-		}
-		msg, err = encrypt.EncryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, msg)
+		reply, err = encrypt.EncryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, reply)
 		if err != nil {
 			log.Fatalf("pkg pod; could not encrypt response: %s", err)
 		}
 		p.state.NonceSeq++
 		p.state.Save()
 
-		log.Tracef("pkg pod; sending response: %s", spew.Sdump(msg))
-		p.ble.WriteMessage(msg)
+		log.Tracef("pkg pod; sending response: %s", spew.Sdump(reply))
+		p.ble.WriteMessage(reply)
 
 		log.Debugf("pkg pod; reading response ACK. Nonce seq %d", p.state.NonceSeq)
 		msg, _, didReconnect = p.ble.ReadMessageWithTimeout(3 * time.Minute)
@@ -429,6 +555,45 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		log.Debugf("notifyingStateChange")
 		p.notifyStateChange()
 	}
+}
+
+// verifySignature checks a type 4 command against the phone's key from
+// pairing. Caller holds p.mtx.
+func (p *Pod) verifySignature(msg *message.Message) bool {
+	if len(p.state.PDMPublicKey) == 0 {
+		log.Warnf("pkg pod; a signed command, but no phone key from pairing to check it with")
+		return false
+	}
+	ok, err := pair.VerifySignedMessage(p.state.PDMPublicKey, msg.Raw[:16], msg.Payload, msg.Signature)
+	if err != nil {
+		log.Errorf("pkg pod; could not check the command's signature: %s", err)
+	} else if !ok {
+		log.Errorf("pkg pod; the command's signature does not verify")
+	} else {
+		log.Debugf("pkg pod; the command's signature verifies")
+		return true
+	}
+	p.badSignatures++
+	return false
+}
+
+// answerAID answers an Omnipod 5 AID setup command. Caller holds p.mtx.
+func (p *Pod) answerAID(msg *message.Message, payload []byte) (*message.Message, error) {
+	cmd, err := aid.Parse(payload)
+	if err != nil {
+		return nil, fmt.Errorf("could not parse AID command %q: %s", payload, err)
+	}
+	answer := p.aid.Respond(cmd)
+	log.Infof("pkg pod; AID %s %s %q; answering %q", cmd.Kind, cmd.Key(), cmd.Data, answer)
+	p.state.MsgSeq++
+	p.state.Save()
+	return response.RawMessage(answer, &response.ResponseMetadata{
+		Dst:    msg.Source,
+		Src:    msg.Destination,
+		MsgSeq: p.state.MsgSeq,
+		AckSeq: msg.SequenceNumber + 1,
+		Mode:   p.state.Mode,
+	}), nil
 }
 
 func (p *Pod) makeGeneralStatusResponse() response.Response {
@@ -505,6 +670,13 @@ func (p *Pod) makeType5StatusResponse() response.Response {
 
 func (p *Pod) getResponse(cmd command.Command) response.Response {
 	var rsp response.Response
+
+	switch c := cmd.(type) {
+	case *command.GetVersion: // 0x07, AssignAddress: the shorter version response
+		return response.AssignAddressResponse(p.state.Mode)
+	case *command.SetUniqueID: // 0x03, SetupPod: the longer version response
+		return response.SetupPodResponse(p.state.Mode, c.Payload)
+	}
 
 	getStatus, isStatusRequest := cmd.(*command.GetStatus)
 	if p.state.MinutesActive() >= 80 * 60 && p.state.FaultEvent == 0 {

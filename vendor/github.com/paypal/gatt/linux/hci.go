@@ -25,6 +25,11 @@ type HCI struct {
 	bufCnt  chan struct{}
 	bufSize int
 
+	// The longest link-layer packets the controller sends, 0 without LE
+	// Data Length Extension (enableDataLength).
+	maxTxOctets uint16
+	maxTxTime   uint16
+
 	maxConn int
 	connsmu *sync.Mutex
 	conns   map[uint16]*conn
@@ -235,7 +240,41 @@ func (h *HCI) resetDevice() error {
 			return err
 		}
 	}
+	h.enableDataLength()
 	return nil
+}
+
+// enableDataLength turns LE Data Length Extension back on, which the Reset
+// turns off: link-layer packets of up to 251 bytes rather than 27. A Pi
+// without it was given an ATT MTU of 185 by an iPhone, seven 27-byte packets;
+// an Omnipod 5's 244-byte packets need 247, one 251-byte packet.
+func (h *HCI) enableDataLength() {
+	rsp, err := h.c.Send(cmd.LEReadMaximumDataLength{})
+	if err != nil || len(rsp) < 9 || rsp[0] != 0x00 {
+		log.Printf("hci: the controller has no LE Data Length Extension (% X); link-layer packets stay at 27 bytes", rsp)
+		return
+	}
+	tx, txTime := uint16(rsp[1])|uint16(rsp[2])<<8, uint16(rsp[3])|uint16(rsp[4])<<8
+	rx := uint16(rsp[5]) | uint16(rsp[6])<<8
+	if err := h.c.SendAndCheckResp(cmd.LEWriteSuggestedDefaultDataLength{
+		SuggestedMaxTxOctets: tx,
+		SuggestedMaxTxTime:   txTime,
+	}, []byte{0x00}); err != nil {
+		log.Printf("hci: setting %d-byte link-layer packets: %s", tx, err)
+		return
+	}
+	h.maxTxOctets, h.maxTxTime = tx, txTime
+	// The default mask leaves out Data Length Change (bit 6).
+	if err := h.c.SendAndCheckResp(cmd.LESetEventMask{LEEventMask: 0x000000000000005F}, []byte{0x00}); err != nil {
+		log.Printf("hci: asking for Data Length Change events: %s", err)
+	}
+	// Write ACL data in pieces as long as the controller takes, not 27 bytes.
+	if rsp, err := h.c.Send(cmd.LEReadBufferSize{}); err == nil && len(rsp) >= 4 && rsp[0] == 0x00 {
+		if n := int(rsp[1]) | int(rsp[2])<<8; n > h.bufSize {
+			h.bufSize = n
+		}
+	}
+	log.Printf("hci: link-layer packets of up to %d bytes out, %d in (LE Data Length Extension); ACL data in %d-byte pieces", tx, rx, h.bufSize)
 }
 
 func (h *HCI) handleAdvertisement(b []byte) {
@@ -304,6 +343,15 @@ func (h *HCI) handleConnection(b []byte) {
 	h.connsmu.Lock()
 	h.conns[hh] = c
 	h.connsmu.Unlock()
+	if h.maxTxOctets > 0 {
+		if err := h.c.SendAndCheckResp(cmd.LESetDataLength{
+			ConnectionHandle: hh,
+			TxOctets:         h.maxTxOctets,
+			TxTime:           h.maxTxTime,
+		}, []byte{0x00}); err != nil {
+			log.Printf("hci: asking for %d-byte link-layer packets: %s", h.maxTxOctets, err)
+		}
+	}
 	h.setAdvertiseEnable(true)
 
 	// FIXME: sloppiness. This call should be called by the package user once we
@@ -357,6 +405,11 @@ func (h *HCI) handleLEMeta(b []byte) error {
 		// anything to do here?
 	case evt.LEAdvertisingReport:
 		go h.handleAdvertisement(b)
+	case evt.LEDataLengthChange:
+		if len(b) >= 11 {
+			log.Printf("hci: the link now carries packets of up to %d bytes out, %d in",
+				uint16(b[3])|uint16(b[4])<<8, uint16(b[7])|uint16(b[8])<<8)
+		}
 	// case evt.LEReadRemoteUsedFeaturesComplete:
 	// case evt.LELTKRequest:
 	// case evt.LERemoteConnectionParameterRequest:

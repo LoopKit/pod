@@ -7,14 +7,33 @@ import (
 	toml "github.com/pelletier/go-toml"
 	log "github.com/sirupsen/logrus"
 
+	"github.com/avereha/pod/pkg/mode"
 	"github.com/avereha/pod/pkg/response"
 )
 
 type PODState struct {
+	// Mode is the pod the simulator plays, DASH or Omnipod 5. It is fixed
+	// when the pod is created (-fresh) so a restart without -mode keeps the
+	// pod the phone paired with. An older state file without it is DASH.
+	Mode mode.Mode `toml:"mode"`
+
 	LTK       []byte `toml:"ltk"`
 	EapAkaSeq uint64 `toml:"eap_aka_seq"`
 
 	Id []byte `toml:"id"` // 4 byte
+
+	// ControllerID is the phone's 4-byte id, from its HELLO. A paired
+	// Omnipod 5 advertises it in its service UUID.
+	ControllerID []byte `toml:"controller_id"`
+
+	// An Omnipod 5 pod's identity: the P-256 key it signs its pairing with
+	// and the certificate that carries the key, made at its first pairing.
+	O5PrivateKey []byte `toml:"o5_private_key"`
+	O5CertDER    []byte `toml:"o5_cert_der"`
+
+	// PDMPublicKey is the phone's P-256 signing key, from the certificate
+	// it sent in SPS2, which signs its type 4 commands.
+	PDMPublicKey []byte `toml:"pdm_public_key"`
 
 	MsgSeq   uint8  `toml:"msg_seq"`   // TODO: is this the same as nonceSeq?
 	CmdSeq   uint8  `toml:"cmd_seq"`   // TODO: are all those 3 the same number ???
@@ -34,7 +53,7 @@ type PODState struct {
 	FaultTime        uint16 `toml:"fault_time"`
 	Delivered        uint16 `toml:"delivered"`
 
-	TriggerTimes     [8]uint16 `toml:"trigger_times"`
+	TriggerTimes [8]uint16 `toml:"trigger_times"`
 
 	// At some point these could be replaced with details
 	// of each kind of delivery (volume, start time, schedule, etc)
@@ -51,12 +70,22 @@ type PODState struct {
 }
 
 // NewFreshState is a new pod, not yet paired.
-func NewFreshState(filename string) *PODState {
+func NewFreshState(filename string, m mode.Mode) *PODState {
 	return &PODState{
+		Mode:           m.Normalized(),
 		Reservoir:      150 / 0.05,
 		ActivationTime: time.Now(),
 		Filename:       filename,
 	}
+}
+
+// ResolveMode picks the mode a restarted pod runs in: the one it was
+// created with. A -mode flag that differs is reported so the operator can
+// be warned; the flag only decides a fresh pod. A state file from before
+// modes existed is a DASH pod.
+func ResolveMode(state *PODState, flag mode.Mode) (resolved mode.Mode, conflict bool) {
+	saved := state.Mode.Normalized()
+	return saved, saved != flag.Normalized()
 }
 
 func NewState(filename string) (*PODState, error) {

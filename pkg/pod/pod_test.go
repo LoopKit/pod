@@ -11,15 +11,17 @@ import (
 	"github.com/avereha/pod/pkg/bluetooth"
 	"github.com/avereha/pod/pkg/eap"
 	"github.com/avereha/pod/pkg/message"
+	"github.com/avereha/pod/pkg/mode"
 	"github.com/wmnsk/milenage"
 )
 
 // radio carries one side's notifications to the other side, and records
 // when the pod hangs up.
 type radio struct {
-	mu     sync.Mutex
-	peer   *bluetooth.Ble
-	hungUp chan bool
+	mu         sync.Mutex
+	peer       *bluetooth.Ble
+	hungUp     chan bool
+	advertised chan []byte // the ids the pod advertises
 }
 
 func (r *radio) to() *bluetooth.Ble {
@@ -42,7 +44,13 @@ func (r *radio) NotifyData(p bluetooth.Packet) error {
 	return nil
 }
 
-func (r *radio) Advertise([]byte) error                     { return nil }
+func (r *radio) Advertise(id []byte) error {
+	select {
+	case r.advertised <- id:
+	default:
+	}
+	return nil
+}
 func (r *radio) AdvertiseState(bluetooth.AdvertState) error { return nil }
 
 func (r *radio) Disconnect() {
@@ -53,7 +61,7 @@ func (r *radio) Disconnect() {
 }
 
 func newBle(t *testing.T, r *radio) *bluetooth.Ble {
-	b, err := bluetooth.New(func(*bluetooth.Ble) (bluetooth.Radio, error) { return r, nil })
+	b, err := bluetooth.New(mode.Dash, func(*bluetooth.Ble) (bluetooth.Radio, error) { return r, nil })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +75,7 @@ func TestAGarbledSessionMessageHangsUp(t *testing.T) {
 	toPod.peer = podBle
 	toPhone.peer = phone
 
-	state := NewFreshState(filepath.Join(t.TempDir(), "state.toml"))
+	state := NewFreshState(filepath.Join(t.TempDir(), "state.toml"), mode.Dash)
 	state.LTK = make([]byte, 16)
 	p := New(podBle, state)
 
@@ -140,7 +148,7 @@ func TestAStaleSqnGetsASynchronizationFailure(t *testing.T) {
 	toPhone.peer = phone
 
 	ltk := bytes.Repeat([]byte{0x5a}, 16)
-	state := NewFreshState(filepath.Join(t.TempDir(), "state.toml"))
+	state := NewFreshState(filepath.Join(t.TempDir(), "state.toml"), mode.Dash)
 	state.LTK = ltk
 	state.EapAkaSeq = 40
 	p := New(podBle, state)
@@ -208,7 +216,7 @@ func TestABadAutnHangsUp(t *testing.T) {
 	toPod.peer = podBle
 	toPhone.peer = phone
 
-	state := NewFreshState(filepath.Join(t.TempDir(), "state.toml"))
+	state := NewFreshState(filepath.Join(t.TempDir(), "state.toml"), mode.Dash)
 	state.LTK = bytes.Repeat([]byte{0x5a}, 16)
 	p := New(podBle, state)
 
