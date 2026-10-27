@@ -338,6 +338,9 @@ const (
 	opLETestEnd                           = leCtl<<10 | 0x001f // LE Test End
 	opLERemoteConnectionParameterReply    = leCtl<<10 | 0x0020 // LE Remote Connection Parameter Request Reply
 	opLERemoteConnectionParameterNegReply = leCtl<<10 | 0x0021 // LE Remote Connection Parameter Request Negative Reply
+	opLESetDataLength                     = leCtl<<10 | 0x0022 // LE Set Data Length
+	opLEWriteSuggestedDefaultDataLength   = leCtl<<10 | 0x0024 // LE Write Suggested Default Data Length
+	opLEReadMaximumDataLength             = leCtl<<10 | 0x002f // LE Read Maximum Data Length
 )
 
 var o = util.Order
@@ -527,7 +530,7 @@ type LESetEventMaskRP struct{ Status uint8 }
 type LEReadBufferSize struct{}
 
 func (c LEReadBufferSize) Opcode() int      { return opLEReadBufferSize }
-func (c LEReadBufferSize) Len() int         { return 1 }
+func (c LEReadBufferSize) Len() int         { return 0 }
 func (c LEReadBufferSize) Marshal(b []byte) {}
 
 type LEReadBufferSizeRP struct {
@@ -992,4 +995,56 @@ func (c LERemoteConnectionParameterNegReply) Marshal(b []byte) {
 type LERemoteConnectionParameterNegReplyRP struct {
 	Status           uint8
 	ConnectionHandle uint16
+}
+
+// LE Set Data Length (0x0022)
+type LESetDataLength struct {
+	ConnectionHandle uint16
+	TxOctets         uint16
+	TxTime           uint16
+}
+
+func (c LESetDataLength) Opcode() int { return opLESetDataLength }
+func (c LESetDataLength) Len() int    { return 6 }
+func (c LESetDataLength) Marshal(b []byte) {
+	o.PutUint16(b[0:], c.ConnectionHandle)
+	o.PutUint16(b[2:], c.TxOctets)
+	o.PutUint16(b[4:], c.TxTime)
+}
+
+type LESetDataLengthRP struct {
+	Status           uint8
+	ConnectionHandle uint16
+}
+
+// LE Write Suggested Default Data Length (0x0024)
+type LEWriteSuggestedDefaultDataLength struct {
+	SuggestedMaxTxOctets uint16
+	SuggestedMaxTxTime   uint16
+}
+
+func (c LEWriteSuggestedDefaultDataLength) Opcode() int {
+	return opLEWriteSuggestedDefaultDataLength
+}
+func (c LEWriteSuggestedDefaultDataLength) Len() int { return 4 }
+func (c LEWriteSuggestedDefaultDataLength) Marshal(b []byte) {
+	o.PutUint16(b[0:], c.SuggestedMaxTxOctets)
+	o.PutUint16(b[2:], c.SuggestedMaxTxTime)
+}
+
+type LEWriteSuggestedDefaultDataLengthRP struct{ Status uint8 }
+
+// LE Read Maximum Data Length (0x002F)
+type LEReadMaximumDataLength struct{}
+
+func (c LEReadMaximumDataLength) Opcode() int      { return opLEReadMaximumDataLength }
+func (c LEReadMaximumDataLength) Len() int         { return 0 }
+func (c LEReadMaximumDataLength) Marshal(b []byte) {}
+
+type LEReadMaximumDataLengthRP struct {
+	Status               uint8
+	SupportedMaxTxOctets uint16
+	SupportedMaxTxTime   uint16
+	SupportedMaxRxOctets uint16
+	SupportedMaxRxTime   uint16
 }

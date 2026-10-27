@@ -28,6 +28,12 @@ if ! grep -q "pod e2e" emulator/btdev.c; then
 	perl -0pi -e 's{("Unsupported command 0x%4\.4x", opcode\);\n\n)\tcmd_status\(btdev, BT_HCI_ERR_UNKNOWN_COMMAND, opcode\);}{$1\t{\n\t\t/* pod e2e: succeed, as a real controller would */\n\t\tuint8_t ok = BT_HCI_ERR_SUCCESS;\n\t\tcmd_complete(btdev, opcode, &ok, sizeof(ok));\n\t}}' emulator/btdev.c
 	grep -q "pod e2e" emulator/btdev.c || { echo "could not patch emulator/btdev.c of BlueZ $v" >&2; exit 1; }
 fi
+# btdev has no LE Data Length Extension. Answer as a Pi 4's controller does:
+# 251-byte link-layer packets, and a Data Length Change when the pod asks.
+if ! grep -q "pod e2e DLE" emulator/btdev.c; then
+	perl -0pi -e 's{(\n\t\{\n\t\t/\* pod e2e)}{\n\t/* pod e2e DLE: 251-byte link-layer packets */\n\tif (opcode == 0x202f) {\n\t\tuint8_t rsp[9] = { 0, 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08 };\n\t\tcmd_complete(btdev, opcode, rsp, sizeof(rsp));\n\t\treturn NULL;\n\t}\n\tif (opcode == 0x2022 && len >= 2) {\n\t\tconst uint8_t *p = data;\n\t\tuint8_t rsp[3] = { 0, p[0], p[1] };\n\t\tuint8_t ev[10] = { p[0], p[1], 251, 0, 0x48, 0x08, 251, 0, 0x48, 0x08 };\n\t\tcmd_complete(btdev, opcode, rsp, sizeof(rsp));\n\t\tle_meta_event(btdev, 0x07, ev, sizeof(ev));\n\t\treturn NULL;\n\t}\n$1}' emulator/btdev.c
+	grep -q "pod e2e DLE" emulator/btdev.c || { echo "could not add LE Data Length Extension to emulator/btdev.c of BlueZ $v" >&2; exit 1; }
+fi
 [ -f Makefile ] || ./configure -q --disable-systemd --disable-cups --disable-obex --disable-mesh \
 	--disable-midi --disable-manpages --enable-testing --enable-experimental
 make -s -j"$(nproc)" emulator/btvirt

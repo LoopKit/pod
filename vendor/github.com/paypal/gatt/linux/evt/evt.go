@@ -134,6 +134,7 @@ const (
 	LEReadRemoteUsedFeaturesComplete               = 0x04 // LE Read Remote Used Features Complete
 	LELTKRequest                                   = 0x05 // LE LTK Request
 	LERemoteConnectionParameterRequest             = 0x06 // LE Remote Connection Parameter Request
+	LEDataLengthChange                             = 0x07 // LE Data Length Change
 )
 
 type EventHeader struct {

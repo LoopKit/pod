@@ -53,6 +53,9 @@ pod's packets ("Unexpected start frame" in `dmesg`, counted in the summary).
 - **btvirt answers a command it does not implement with Command Status**, and paypal/gatt panics on
   that: its controller reset sends BR/EDR commands such as Write Inquiry Scan Type (0x0c43).
   `setup-vm.sh` patches the emulator to answer them with success, as a real controller does.
+- **btvirt has no LE Data Length Extension.** `setup-vm.sh` adds it, answering as a Pi 4's controller
+  does: 251-byte link-layer packets, and a Data Length Change when the pod asks for them. The pod then
+  writes ACL data in the emulator's 192-byte pieces rather than 27-byte ones.
 - **The controllers are LE-only (`btvirt -L`).** With the default Bluetooth 5.2 ones, the kernel scans
   for the pod with extended scanning, and btdev does not report gatt's legacy advertising to it.
 - **The phone's adapter must have LE on**, or the kernel refuses the connection. The test turns on LE
