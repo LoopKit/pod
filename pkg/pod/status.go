@@ -53,11 +53,13 @@ type Status struct {
 	NonceSeq            uint64    `json:"nonceSeq"`
 	EapAkaSeq           uint64    `json:"eapAkaSeq"`
 	LastProgSeqNum      uint8     `json:"lastProgSeqNum"`
+	BadSignatures       int       `json:"badSignatures"`
 }
 
 func (p *Pod) takeSnapshot() {
 	p.snapMtx.Lock()
 	p.snapshot = *p.state
+	p.snapshotBadSignatures = p.badSignatures
 	p.snapMtx.Unlock()
 	p.ble.SetAdvertisedState(bluetooth.AdvertState{Fault: p.state.FaultEvent, Alerts: p.state.ActiveAlertSlots})
 }
@@ -66,6 +68,7 @@ func (p *Pod) takeSnapshot() {
 func (p *Pod) Status() Status {
 	p.snapMtx.Lock()
 	s := p.snapshot
+	badSignatures := p.snapshotBadSignatures
 	crash := ""
 	if crashBeforeProcessingCommand {
 		crash = "before"
@@ -115,5 +118,6 @@ func (p *Pod) Status() Status {
 		NonceSeq:            s.NonceSeq,
 		EapAkaSeq:           s.EapAkaSeq,
 		LastProgSeqNum:      s.LastProgSeqNum,
+		BadSignatures:       badSignatures,
 	}
 }

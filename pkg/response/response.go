@@ -6,6 +6,7 @@ import (
 
 	"github.com/avereha/pod/pkg/crc"
 	"github.com/avereha/pod/pkg/message"
+	"github.com/avereha/pod/pkg/mode"
 
 	log "github.com/sirupsen/logrus"
 )
@@ -22,9 +23,22 @@ type ResponseMetadata struct {
 	RequestID []byte
 	Src       []byte
 	Dst       []byte
+
+	// Mode decides the CRC: an Omnipod 5 ends its responses with the
+	// Omnipod CRC16, which OmnipodKit checks; a DASH pod's CRC follows an
+	// algorithm nobody has matched and OmnipodKit ignores it, so the
+	// simulator sends zeros as it always has.
+	Mode mode.Mode
 }
 
-func payloadWithHeaderAndCRC(rsp Response, seq uint8, responseID []byte) ([]byte, error) {
+func messageCRC(m mode.Mode, data []byte) []byte {
+	if m.IsO5() {
+		return crc.CRC16(data)
+	}
+	return []byte{0, 0}
+}
+
+func payloadWithHeaderAndCRC(rsp Response, seq uint8, responseID []byte, m mode.Mode) ([]byte, error) {
 	var buf bytes.Buffer
 	var header uint16
 	var msgType uint16
@@ -49,7 +63,7 @@ func payloadWithHeaderAndCRC(rsp Response, seq uint8, responseID []byte) ([]byte
 	buf.WriteByte(byte(header >> 8))
 	buf.WriteByte(byte(header))
 	buf.Write(payload)
-	buf.Write(crc.CRC16(buf.Bytes()))
+	buf.Write(messageCRC(m, buf.Bytes()))
 
 	log.Infof("pkg response 0x%x; HEX, %x", msgType, buf.Bytes())
 
@@ -59,7 +73,7 @@ func payloadWithHeaderAndCRC(rsp Response, seq uint8, responseID []byte) ([]byte
 func Marshal(rsp Response, metadata *ResponseMetadata) (*message.Message, error) {
 	var buf bytes.Buffer
 
-	payload, err := payloadWithHeaderAndCRC(rsp, metadata.CmdSeq, metadata.RequestID)
+	payload, err := payloadWithHeaderAndCRC(rsp, metadata.CmdSeq, metadata.RequestID, metadata.Mode)
 	if err != nil {
 		return nil, err
 	}
@@ -70,12 +84,19 @@ func Marshal(rsp Response, metadata *ResponseMetadata) (*message.Message, error)
 	buf.WriteByte(byte(totalLen))
 	buf.Write(payload)
 
+	return RawMessage(buf.Bytes(), metadata), nil
+}
+
+// RawMessage is the pod's reply carrying payload as it is, for an Omnipod
+// 5 AID setup answer, which is plain text rather than an SLPE-wrapped
+// Omnipod response.
+func RawMessage(payload []byte, metadata *ResponseMetadata) *message.Message {
 	msg := message.NewMessage(message.MessageTypeEncrypted, metadata.Src, metadata.Dst)
-	msg.Payload = buf.Bytes()
+	msg.Payload = payload
 	msg.SequenceNumber = metadata.MsgSeq
 	msg.Ack = true
 	msg.AckNumber = metadata.AckSeq
 	msg.Eqos = 1 // It seems to be some sort of flag that this is a reply
 	// TODO fill other msg fields
-	return msg, nil
+	return msg
 }

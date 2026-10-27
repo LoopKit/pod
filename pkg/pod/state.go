@@ -26,6 +26,15 @@ type PODState struct {
 	// Omnipod 5 advertises it in its service UUID.
 	ControllerID []byte `toml:"controller_id"`
 
+	// An Omnipod 5 pod's identity: the P-256 key it signs its pairing with
+	// and the certificate that carries the key, made at its first pairing.
+	O5PrivateKey []byte `toml:"o5_private_key"`
+	O5CertDER    []byte `toml:"o5_cert_der"`
+
+	// PDMPublicKey is the phone's P-256 signing key, from the certificate
+	// it sent in SPS2, which signs its type 4 commands.
+	PDMPublicKey []byte `toml:"pdm_public_key"`
+
 	MsgSeq   uint8  `toml:"msg_seq"`   // TODO: is this the same as nonceSeq?
 	CmdSeq   uint8  `toml:"cmd_seq"`   // TODO: are all those 3 the same number ???
 	NonceSeq uint64 `toml:"nonce_seq"` // or 16?

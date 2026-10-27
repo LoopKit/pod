@@ -58,6 +58,18 @@ type Command interface {
 	GetSeq() uint8
 }
 
+// RequiresSignature says whether an Omnipod 5 phone must sign the command
+// (send it as a type 4 message): the insulin schedule (and so every bolus,
+// basal and temp basal), deactivation and cancel delivery (OmnipodKit
+// BleMessageTransport.requiresType4Signing).
+func RequiresSignature(t Type) bool {
+	switch t {
+	case PROGRAM_INSULIN, DEACTIVATE, STOP_DELIVERY:
+		return true
+	}
+	return false
+}
+
 type CommandReader struct {
 	Data []byte // keep it simple for now
 }

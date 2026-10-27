@@ -2,6 +2,7 @@ package eap
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/hex"
 	"fmt"
 
@@ -195,12 +196,19 @@ func NewEapAkaChallenge(k []byte, lastSqn uint64) *EapAkaChallenge {
 	op, _ := hex.DecodeString("cdc202d5123e20f62b6d676ac72cb318")
 	// amf, _ := hex.DecodeString("b9b9")
 	log.Debugf("Starting EAP-AKA session; last accepted SQN: %d", lastSqn)
+	// The pod's half of the session nonce prefix; a real pod draws a new
+	// one for every session.
+	podIV := make([]byte, 4)
+	if _, err := rand.Read(podIV); err != nil {
+		log.Warnf("pkg eap; no random pod IV (%s); using a fixed one", err)
+		podIV = []byte{0xa, 0xa, 0xa, 0xa}
+	}
 	return &EapAkaChallenge{
 		k:       k,
 		op:      op,
 		lastSqn: lastSqn,
-		amf:     47545,                      // b9b9
-		podIV:   []byte{0xa, 0xa, 0xa, 0xa}, // constant for now, easier to debug. TODO
+		amf:     47545, // b9b9
+		podIV:   podIV,
 	}
 }
 
@@ -300,9 +308,7 @@ func (e *EapAkaChallenge) GenerateChallengeResponse() (*message.Message, error) 
 		e.amf,
 	)
 
-	// TODO check AUTN
-
-	// TODO check if IK/AK is used for anything
+	// CheckSqn has verified AUTN.
 	e.res, e.ck, _, _, err = mil.F2345()
 	if err != nil {
 		return nil, err
