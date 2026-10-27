@@ -141,3 +141,17 @@ func ExampleCommand_String() {
 	fmt.Println(cmd)
 	// Output: set 3.9 = 38 (1 bytes)
 }
+
+// An AID answer is acknowledged by the phone exactly as any other
+// response is (OmnipodKit's sendO5AidCommand ends by sending an ACK), so
+// an exchange is: command in, answer out, acknowledgement in. A pod that
+// expects only the first two reads the acknowledgement as a command, and
+// an acknowledgement carries no payload, so it does not parse as one.
+func TestAcknowledgementIsNotAnAIDCommand(t *testing.T) {
+	if Looks(nil) {
+		t.Error("an empty acknowledgement was taken for an AID command")
+	}
+	if Looks([]byte{}) {
+		t.Error("an empty acknowledgement was taken for an AID command")
+	}
+}

@@ -2,6 +2,7 @@ package pod
 
 import (
 	"encoding/json"
+	"fmt"
 	"sync"
 	"time"
 
@@ -315,11 +316,32 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		// does not acknowledge the answer.
 		if p.isO5() && aid.Looks(decrypted.Payload) {
 			ok := p.handleAidCommand(decrypted.Payload, msg.Source, msg.Destination, msg.SequenceNumber)
+			if ok {
+				// The phone acknowledges an AID answer as it does any
+				// other response (sendO5AidCommand), and that
+				// acknowledgement carries a nonce of its own.
+				ack, reconnected := p.readResponseAck()
+				if ack == nil {
+					p.state.Save()
+					p.takeSnapshot()
+					p.mtx.Unlock()
+					log.Infof("pkg pod; no AID answer ACK — re-establishing session")
+					if !reconnected {
+						p.ble.ShutdownConnection()
+					}
+					go p.StartAcceptingCommands()
+					return
+				}
+				if err := p.consumeAck(ack); err != nil {
+					log.Errorf("pkg pod; %s", err)
+					ok = false
+				}
+			}
 			p.state.Save()
 			p.takeSnapshot()
 			p.mtx.Unlock()
 			if !ok {
-				log.Errorf("pkg pod; could not answer the AID command — re-establishing session")
+				log.Errorf("pkg pod; could not complete the AID command — re-establishing session")
 				p.ble.ShutdownConnection()
 				go p.StartAcceptingCommands()
 				return
@@ -330,7 +352,18 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 
 		cmd, err := command.Unmarshal(decrypted.Payload)
 		if err != nil {
-			log.Fatalf("pkg pod; could not unmarshal command: %s", err)
+			// Exiting here would take the pod's radio with it, and the
+			// app would report its Bluetooth gone rather than the message
+			// the pod could not read. Hang up instead: the phone comes
+			// back and sets up a new session.
+			log.Errorf("pkg pod; could not read the command %x: %s", decrypted.Payload, err)
+			p.state.Save()
+			p.takeSnapshot()
+			p.mtx.Unlock()
+			log.Infof("pkg pod; re-establishing the session")
+			p.ble.ShutdownConnection()
+			go p.StartAcceptingCommands()
+			return
 		}
 		cmdSeq, requestID, err := cmd.GetHeaderData()
 		if err != nil {
@@ -422,7 +455,7 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		p.ble.WriteMessage(msg)
 
 		log.Debugf("pkg pod; reading response ACK. Nonce seq %d", p.state.NonceSeq)
-		msg, _, didReconnect = p.ble.ReadMessageWithTimeout(3 * time.Minute)
+		msg, didReconnect = p.readResponseAck()
 		if msg == nil {
 			// The phone never acknowledged; it will ask again on its next session.
 			p.state.Save()
@@ -436,13 +469,8 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 			return
 		}
 		// TODO check for SEQ numbers here and the Ack flag
-		decrypted, err = encrypt.DecryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, msg)
-		if err != nil {
-			log.Fatalf("pkg pod; could not decrypt message: %s", err)
-		}
-		p.state.NonceSeq++
-		if len(decrypted.Payload) != 0 {
-			log.Fatalf("pkg pod; this should be empty message with ACK header %s", spew.Sdump(msg))
+		if err := p.consumeAck(msg); err != nil {
+			log.Fatalf("pkg pod; %s", err)
 		}
 		p.state.Save()
 		p.takeSnapshot()
@@ -451,6 +479,29 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		log.Debugf("notifyingStateChange")
 		p.notifyStateChange()
 	}
+}
+
+// readResponseAck waits for the phone to acknowledge a response the pod
+// has just sent. A nil message means the phone never answered, and the
+// second value says whether it came back on a new connection.
+func (p *Pod) readResponseAck() (*message.Message, bool) {
+	msg, _, didReconnect := p.ble.ReadMessageWithTimeout(3 * time.Minute)
+	return msg, didReconnect
+}
+
+// consumeAck decrypts an acknowledgement and advances the nonce it used.
+// An acknowledgement carries no payload; anything else means the pod and
+// the phone no longer agree on where they are.
+func (p *Pod) consumeAck(msg *message.Message) error {
+	decrypted, err := encrypt.DecryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, msg)
+	if err != nil {
+		return fmt.Errorf("could not decrypt the acknowledgement: %s", err)
+	}
+	p.state.NonceSeq++
+	if len(decrypted.Payload) != 0 {
+		return fmt.Errorf("expected an empty acknowledgement, got %x", decrypted.Payload)
+	}
+	return nil
 }
 
 // encryptAndSend encrypts a message under the session key and writes it
