@@ -197,44 +197,69 @@ func (a *AdvPacket) AppendManufacturerData(id uint16, b []byte) *AdvPacket {
 // AppendUUIDFit appends a BLE advertised service UUID
 // packet field if it fits in the packet, and reports whether the UUID fit.
 func (a *AdvPacket) AppendUUIDFit(uu []UUID) bool {
-	var b bytes.Buffer
+	// PATCHED for github.com/LoopKit/pod: the original wrote every UUID into
+	// one 16-bit list regardless of its length, so a 128-bit UUID went out
+	// mislabelled and no central matched it. An Omnipod 5 advertises a single
+	// 128-bit UUID, so the length-aware packing the upstream file left
+	// commented out is restored here, with its size accounting corrected:
+	// UUIDs of one length share a single field, so the two bytes of field
+	// header are paid once per list, not once per UUID.
+	//
+	// Restore this after `go mod vendor`.
+	var u16, u128 []UUID
 	for _, u := range uu {
-		b.Write(u.b)
+		if u.Equal(attrGAPUUID) || u.Equal(attrGATTUUID) {
+			continue
+		}
+		switch u.Len() {
+		case 2:
+			u16 = append(u16, u)
+		case 16:
+			u128 = append(u128, u)
+		}
 	}
-	a.AppendField(typeAllUUID16, b.Bytes())
 
-	// Iterate all UUIDs to see if they fit in the packet or not.
-	/*	fit, l := true, len(a.b)
-		for _, u := range uu {
-			if u.Equal(attrGAPUUID) || u.Equal(attrGATTUUID) {
-				continue
-			}
-			l += 2 + u.Len()
-			if l > MaxEIRPacketLength {
-				fit = false
-				break
-			}
+	// size is what the packet would take with the UUIDs still to be written.
+	size := func(n16, n128 int) int {
+		n := len(a.b)
+		if n16 > 0 {
+			n += 2 + 2*n16
 		}
+		if n128 > 0 {
+			n += 2 + 16*n128
+		}
+		return n
+	}
 
-		// Append the UUIDs until they no longer fit.
-		for _, u := range uu {
-			if u.Equal(attrGAPUUID) || u.Equal(attrGATTUUID) {
-				continue
-			}
-			if len(a.b)+2+u.Len() > MaxEIRPacketLength {
-				break
-			}
-			switch l = u.Len(); {
-			case l == 2 && fit:
-				a.AppendField(typeAllUUID16, u.b)
-			case l == 16 && fit:
-				a.AppendField(typeAllUUID128, u.b)
-			case l == 2 && !fit:
-				a.AppendField(typeSomeUUID16, u.b)
-			case l == 16 && !fit:
-				a.AppendField(typeSomeUUID128, u.b)
-			}
+	// Drop UUIDs, longest first, until what is left fits. Anything dropped
+	// makes the lists incomplete.
+	fit := true
+	for size(len(u16), len(u128)) > MaxEIRPacketLength {
+		fit = false
+		if len(u128) > 0 {
+			u128 = u128[:len(u128)-1]
+		} else if len(u16) > 0 {
+			u16 = u16[:len(u16)-1]
+		} else {
+			break
 		}
-	*/
-	return true
+	}
+
+	appendList := func(list []UUID, complete, incomplete byte) {
+		if len(list) == 0 {
+			return
+		}
+		var b bytes.Buffer
+		for _, u := range list {
+			b.Write(u.b)
+		}
+		t := complete
+		if !fit {
+			t = incomplete
+		}
+		a.AppendField(t, b.Bytes())
+	}
+	appendList(u16, typeAllUUID16, typeSomeUUID16)
+	appendList(u128, typeAllUUID128, typeSomeUUID128)
+	return fit
 }
