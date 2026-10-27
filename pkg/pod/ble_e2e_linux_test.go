@@ -16,7 +16,9 @@ package pod
 // PHONE_MTU is the MTU the phone offers as it connects ("none" to offer
 // none); PHONE_SERVER_MTU is how it answers an exchange the pod starts: an
 // MTU, "error" or "ignore"; PHONE_HCI is the phone's adapter (default 1).
-// Like iOS, the phone cuts a write without response to MTU-3 bytes.
+// Like iOS, the phone cuts a write without response to MTU-3 bytes and sends
+// a longer write with response as a long write; PHONE_FALLBACK=1 sends an
+// Omnipod 5 packet that does not fit a write without response with response.
 
 import (
 	"bytes"
@@ -48,6 +50,8 @@ const (
 	attReadGroup  = 0x10
 	attWriteReq   = 0x12
 	attWriteRsp   = 0x13
+	attPrepWrite  = 0x16
+	attExecWrite  = 0x18
 	attNotify     = 0x1b
 	attWriteCmd   = 0x52
 )
@@ -61,9 +65,12 @@ type attLink struct {
 	reqMu     sync.Mutex // one request at a time
 	mu        sync.Mutex
 	mtu       int
+	offered   int // the MTU the phone offered in its own exchange
 	pending   bool
 	truncated int
-	podErrors int // error PDUs the pod sent unasked
+	long      int  // long writes (Prepare Write, Execute Write)
+	podErrors int  // error PDUs the pod sent unasked
+	fallback  bool // PHONE_FALLBACK: a packet too long to write without response goes with response
 
 	rsp       chan []byte
 	podAsked  chan int
@@ -192,6 +199,14 @@ func (l *attLink) read() {
 			if !pending && pdu[0] == attError {
 				l.podErrors++
 			}
+			// The answer to the phone's own MTU exchange: record it here,
+			// in order, before an exchange the pod starts next.
+			if pending && pdu[0] == attMTURsp && len(pdu) >= 3 {
+				l.mtu = l.offered
+				if rx := le16(pdu[1:3]); rx < l.mtu {
+					l.mtu = rx
+				}
+			}
 			l.mu.Unlock()
 			if pending {
 				l.rsp <- pdu
@@ -233,21 +248,54 @@ func (l *attLink) MTU() int {
 }
 
 // write writes a value as OmnipodKit does: without response on an Omnipod
-// 5, cut to MTU-3 bytes as iOS does; with response on DASH.
+// 5, cut to MTU-3 bytes as iOS does; with response on DASH, which iOS sends
+// as a long write when it is longer than MTU-3. With fallback, an Omnipod 5
+// packet too long to write without response goes with response.
 func (l *attLink) write(h uint16, v []byte) error {
-	if max := l.MTU() - 3; len(v) > max {
-		l.mu.Lock()
-		l.truncated++
-		l.mu.Unlock()
-		v = v[:max]
+	max := l.MTU() - 3
+	op := l.writeType
+	if op == attWriteCmd && len(v) > max {
+		if !l.fallback {
+			l.mu.Lock()
+			l.truncated++
+			l.mu.Unlock()
+			v = v[:max]
+		} else {
+			op = attWriteReq
+		}
 	}
-	pdu := append([]byte{l.writeType, byte(h), byte(h >> 8)}, v...)
-	if l.writeType == attWriteCmd {
-		l.send(pdu)
+	if op == attWriteCmd {
+		l.send(append([]byte{op, byte(h), byte(h >> 8)}, v...))
 		return nil
 	}
-	if r := l.request(pdu); r[0] != attWriteRsp {
+	if len(v) > max {
+		return l.longWrite(h, v)
+	}
+	if r := l.request(append([]byte{op, byte(h), byte(h >> 8)}, v...)); r[0] != attWriteRsp {
 		return fmt.Errorf("write to %#04x answered % x", h, r)
+	}
+	return nil
+}
+
+// longWrite is CoreBluetooth's write with response of a value longer than
+// MTU-3: Prepare Write requests of MTU-5 bytes, then Execute Write.
+func (l *attLink) longWrite(h uint16, v []byte) error {
+	l.mu.Lock()
+	l.long++
+	l.mu.Unlock()
+	part := l.MTU() - 5
+	for off := 0; off < len(v); off += part {
+		end := off + part
+		if end > len(v) {
+			end = len(v)
+		}
+		req := append([]byte{attPrepWrite, byte(h), byte(h >> 8), byte(off), byte(off >> 8)}, v[off:end]...)
+		if r := l.request(req); r[0] != attPrepWrite+1 || !bytes.Equal(r[1:], req[1:]) {
+			return fmt.Errorf("prepare write to %#04x at %d answered % x", h, off, r)
+		}
+	}
+	if r := l.request([]byte{attExecWrite, 1}); r[0] != attExecWrite+1 {
+		return fmt.Errorf("execute write to %#04x answered % x", h, r)
 	}
 	return nil
 }
@@ -380,21 +428,19 @@ func TestOverTheAir(t *testing.T) {
 	if m.IsO5() {
 		l.writeType = attWriteCmd
 	}
+	l.fallback = env("PHONE_FALLBACK", "") != ""
 
 	// iOS starts its own MTU exchange as it connects.
 	if offer := env("PHONE_MTU", "185"); offer != "none" {
 		mtu, _ := strconv.Atoi(offer)
+		l.mu.Lock()
+		l.offered = mtu
+		l.mu.Unlock()
 		r := l.request([]byte{attMTUReq, byte(mtu), byte(mtu >> 8)})
 		if r[0] != attMTURsp {
 			t.Fatalf("MTU exchange answered % x", r)
 		}
-		if rx := le16(r[1:]); rx < mtu {
-			mtu = rx
-		}
-		l.mu.Lock()
-		l.mtu = mtu
-		l.mu.Unlock()
-		t.Logf("the phone offered %s; the pod answered %d; MTU %d", offer, le16(r[1:]), mtu)
+		t.Logf("the phone offered %s; the pod answered %d", offer, le16(r[1:]))
 	}
 	select {
 	case offer := <-l.podAsked:
@@ -426,7 +472,7 @@ func TestOverTheAir(t *testing.T) {
 
 	ph := &phone{t: t, m: m, ble: phoneBle, controllerID: testController, podID: testPodID, msgSeq: 1}
 	ph.signingKey, _ = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	defer func() { t.Logf("writes cut short: %d", l.truncated) }()
+	defer func() { t.Logf("writes cut short: %d, long writes: %d", l.truncated, l.long) }()
 
 	ph.pair()
 	t.Logf("paired")

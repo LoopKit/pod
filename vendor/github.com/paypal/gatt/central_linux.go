@@ -3,6 +3,7 @@ package gatt
 import (
 	"encoding/binary"
 	"io"
+	"log"
 	"net"
 	"sync"
 )
@@ -24,6 +25,16 @@ type central struct {
 	l2conn      io.ReadWriteCloser
 	notifiers   map[uint16]*notifier
 	notifiersmu *sync.Mutex
+
+	// prepared is the queue of a long write: Prepare Write requests, until
+	// an Execute Write. Only loop touches it.
+	prepared []preparedWrite
+}
+
+type preparedWrite struct {
+	h      uint16
+	offset int
+	value  []byte
 }
 
 func newCentral(a *attrRange, addr net.HardwareAddr, l2conn io.ReadWriteCloser) *central {
@@ -84,6 +95,9 @@ func (c *central) handleReq(b []byte) []byte {
 	case attOpError:
 		// The central refused a request of ours (RequestMTU); an error
 		// gets no response.
+		if len(req) >= 4 && req[0] == attOpMtuReq {
+			log.Printf("att: the central refused our MTU request: error %#02x", req[3])
+		}
 		resp = nil
 	case attOpFindInfoReq:
 		resp = c.handleFindInfo(req)
@@ -99,7 +113,11 @@ func (c *central) handleReq(b []byte) []byte {
 		resp = c.handleReadByGroup(req)
 	case attOpWriteReq, attOpWriteCmd:
 		resp = c.handleWrite(reqType, req)
-	case attOpReadMultiReq, attOpPrepWriteReq, attOpExecWriteReq, attOpSignedWriteCmd:
+	case attOpPrepWriteReq:
+		resp = c.handlePrepWrite(req)
+	case attOpExecWriteReq:
+		resp = c.handleExecWrite(req)
+	case attOpReadMultiReq, attOpSignedWriteCmd:
 		fallthrough
 	default:
 		resp = attErrorRsp(reqType, 0x0000, attEcodeReqNotSupp)
@@ -137,6 +155,7 @@ func (c *central) handleMTURsp(b []byte) []byte {
 		return nil
 	}
 	mtu := binary.LittleEndian.Uint16(b[:2])
+	log.Printf("att: the central answered our MTU request (%d) with %d", c.mtuAsked, mtu)
 	if mtu > c.mtuAsked {
 		mtu = c.mtuAsked
 	}
@@ -144,6 +163,69 @@ func (c *central) handleMTURsp(b []byte) []byte {
 		c.mtu = mtu
 	}
 	return nil
+}
+
+// maxPrepared bounds a long write: 512 bytes is the most an attribute
+// value holds, and iOS's longest write with response.
+const maxPrepared = 512
+
+// REQ: PrepWriteReq(0x16), Handle, Offset, Value
+// RSP: PrepWriteRsp(0x17), the request echoed
+// A long write: a central whose ATT MTU is smaller than the value (an iPhone
+// that negotiated 185 sending a 244-byte Omnipod 5 packet) sends it in parts.
+func (c *central) handlePrepWrite(b []byte) []byte {
+	if len(b) < 4 {
+		return attErrorRsp(attOpPrepWriteReq, 0, attEcodeInvalidPDU)
+	}
+	h := binary.LittleEndian.Uint16(b[:2])
+	a, ok := c.attrs.At(h)
+	if !ok {
+		return attErrorRsp(attOpPrepWriteReq, h, attEcodeInvalidHandle)
+	}
+	if a.props&CharWrite == 0 {
+		return attErrorRsp(attOpPrepWriteReq, h, attEcodeWriteNotPerm)
+	}
+	n := len(b) - 4
+	for _, p := range c.prepared {
+		n += len(p.value)
+	}
+	if n > maxPrepared {
+		return attErrorRsp(attOpPrepWriteReq, h, attEcodePrepQueueFull)
+	}
+	c.prepared = append(c.prepared, preparedWrite{h: h, offset: int(binary.LittleEndian.Uint16(b[2:4])),
+		value: append([]byte{}, b[4:]...)})
+	return append([]byte{attOpPrepWriteRsp}, b...)
+}
+
+// REQ: ExecWriteReq(0x18), Flags (0x00 cancel, 0x01 write)
+// RSP: ExecWriteRsp(0x19)
+// Each handle's parts are joined in order and written as one value, as a
+// Write Request would.
+func (c *central) handleExecWrite(b []byte) []byte {
+	queue := c.prepared
+	c.prepared = nil
+	if len(b) < 1 || b[0] == 0x00 {
+		return []byte{attOpExecWriteRsp}
+	}
+	var order []uint16
+	values := map[uint16][]byte{}
+	for _, p := range queue {
+		v, seen := values[p.h]
+		if !seen {
+			order = append(order, p.h)
+		}
+		if p.offset > len(v) {
+			return attErrorRsp(attOpExecWriteReq, p.h, attEcodeInvalidOffset)
+		}
+		values[p.h] = append(v[:p.offset], p.value...)
+	}
+	for _, h := range order {
+		req := append([]byte{byte(h), byte(h >> 8)}, values[h]...)
+		if rsp := c.handleWrite(attOpWriteReq, req); len(rsp) > 0 && rsp[0] == attOpError {
+			return attErrorRsp(attOpExecWriteReq, h, attEcode(rsp[4]))
+		}
+	}
+	return []byte{attOpExecWriteRsp}
 }
 
 // REQ: FindInfoReq(0x04), StartHandle, EndHandle

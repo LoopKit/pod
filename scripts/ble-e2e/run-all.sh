@@ -7,9 +7,13 @@ here=$(cd "$(dirname "$0")" && pwd)
 pod=${1:-pod}
 bad=0
 
-# check NAME MODE PHONE_MTU PHONE_SERVER_MTU pass|fail
+# check NAME MODE PHONE_MTU PHONE_SERVER_MTU pass|fail [long]
+# "long": the phone sends a packet too long for a write without response with
+# response instead (PHONE_FALLBACK).
 check() {
-	sh "$here/run-scenario.sh" "$1" "$2" "$3" "$4" "$pod" > /dev/null 2>&1
+	fallback=
+	[ "${6:-}" = long ] && fallback=1
+	PHONE_FALLBACK=$fallback sh "$here/run-scenario.sh" "$1" "$2" "$3" "$4" "$pod" > /dev/null 2>&1
 	rc=$?
 	s=$here/out/results/$1/summary.txt
 	got=pass
@@ -36,6 +40,11 @@ check o5-185-error  o5   185  error  fail # the phone refuses the exchange
 check o5-185-ignore o5   185  ignore fail # the phone never answers it
 check o5-527-527    o5   527  527    pass # 256 at once; the pod does not ask
 check o5-none-527   o5   none 527    pass # no exchange from the phone; the pod asks
+# A phone that stays at 185 but sends what does not fit with response: its
+# long writes reach the pod, but the pod's 244-byte notifications are still
+# cut to 182 bytes, as no notification is longer than MTU-3.
+check o5-185-185-long   o5   185  185    fail long
+check o5-185-error-long o5   185  error  fail long
 check dash-185-527  dash 185  527    pass # DASH packets fit 185; the pod does not ask
 check dash-527-527  dash 527  527    pass
 exit $bad

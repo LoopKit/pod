@@ -42,6 +42,7 @@ nothing but their own processes, but `setup-vm.sh` masks `bluetoothd`).
 | `o5-527-527` | 527 | 527 | pass: 256 at once, the pod does not ask |
 | `o5-none-527` | nothing | 527 | pass: the pod asks |
 | `dash-185-527`, `dash-527-527` | 185, 527 | 527 | pass: DASH packets fit any MTU; the pod does not ask |
+| `o5-185-185-long`, `o5-185-error-long` | 185 | 185, an error | fail: the phone sends what does not fit with response, as long writes the pod takes, but the pod's 244-byte notifications are still cut to 182 bytes |
 
 The pod at commit `ba86841` (before the MTU request) fails `o5-185-527` as a Pi did with an iPhone
 offering 185; at `40cd439` (the request without `6dc120d`) the MTU is 256 but the kernel drops the

@@ -5,9 +5,11 @@
 # MODE is dash or o5; PHONE_MTU is what the phone offers as it connects
 # ("none" for nothing); PHONE_SERVER_MTU how it answers an exchange the pod
 # starts (an MTU, "error" or "ignore"); POD_BINARY is in out/ (default pod).
+# PHONE_FALLBACK=1 in the environment: a packet too long for a write without
+# response goes with response (a long write), as OmnipodKit can.
 # Results go to out/results/NAME. See docs/BLE_E2E_TEST.md.
 set -u
-[ "$(id -u)" -eq 0 ] || exec sudo sh "$0" "$@"
+[ "$(id -u)" -eq 0 ] || exec sudo env PHONE_FALLBACK="${PHONE_FALLBACK:-}" sh "$0" "$@"
 name=$1 mode=$2 offer=$3 answer=$4 pod=${5:-pod}
 here=$(cd "$(dirname "$0")" && pwd)
 out=$here/out/results/$name
@@ -41,14 +43,14 @@ for i in $(seq 1 50); do grep -qa "Listening for commands" /tmp/pod-e2e.log 2>/d
 sleep 1
 
 # The test turns on LE and power on hci1 itself, through the management socket.
-env POD_ADDR="$addr" POD_MODE="$mode" PHONE_MTU="$offer" PHONE_SERVER_MTU="$answer" \
+env POD_ADDR="$addr" POD_MODE="$mode" PHONE_MTU="$offer" PHONE_SERVER_MTU="$answer" PHONE_FALLBACK="${PHONE_FALLBACK:-}" \
 	timeout 150 "$here/out/pod_e2e.test" -test.run TestOverTheAir -test.v -test.timeout 120s > "$out/test.log" 2>&1
 rc=$?
 sleep 1
 stop
 cat /tmp/pod-e2e.log | tr -d '\000' | sed 's/\x1b\[[0-9;]*m//g' > "$out/pod.log"
 {
-	echo "scenario $name: pod=$pod mode=$mode phone offers=$offer answers=$answer -> test exit $rc"
+	echo "scenario $name: pod=$pod mode=$mode phone offers=$offer answers=$answer fallback=${PHONE_FALLBACK:-} -> test exit $rc"
 	echo "kernel ACL reassembly errors: $(dmesg | grep -c 'Unexpected .* frame')"
 	grep -E "ATT MTU|panic|ERRO|WARN|NACK|hanging up" "$out/pod.log" | head -20
 	echo "--- test"
