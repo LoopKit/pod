@@ -34,6 +34,7 @@ type simRadio struct {
 	state        AdvertState
 	notifying    map[string]bool // characteristic ids
 	delayed      *time.Timer     // a connect held for its start delay
+	mtu          int             // the ATT MTU given to the app, 0 for none (NewSimRadio)
 }
 
 type simClient struct {
@@ -79,8 +80,11 @@ func (r *simRadio) dataCharUUID() string { return DataCharUUID(r.ble.Mode()) }
 // NewSimRadio serves the pod on ImpossiBLE's socket at path, as the
 // peripheral with identifier id, advertising advertisedID (see
 // Radio.Advertise). ImpossiBLE tells the app it may write 512 bytes at a
-// time, so an Omnipod 5's 244-byte packets need no MTU exchange.
-func NewSimRadio(b *Ble, path, id string, advertisedID []byte) (Radio, error) {
+// time, so an Omnipod 5's 244-byte packets need no MTU exchange; mtu, if not
+// 0, stands for a phone that negotiated that ATT MTU: ImpossiBLE (with g7sim's
+// patch 0008) then cuts the app's writes without response to mtu-3 bytes, as
+// CoreBluetooth does.
+func NewSimRadio(b *Ble, path, id string, advertisedID []byte, mtu int) (Radio, error) {
 	// A live provider (ImpossiBLE's app, g7sim, another pod) answers on the
 	// socket; a stale file from one that died does not.
 	if c, err := net.Dial("unix", path); err == nil {
@@ -92,8 +96,11 @@ func NewSimRadio(b *Ble, path, id string, advertisedID []byte) (Radio, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &simRadio{ble: b, id: id, advertisedID: advertisedID, notifying: map[string]bool{}}
+	r := &simRadio{ble: b, id: id, advertisedID: advertisedID, notifying: map[string]bool{}, mtu: mtu}
 	log.Infof("pkg bluetooth; serving the iOS Simulator on %s as peripheral %s", path, id)
+	if mtu > 0 {
+		log.Infof("pkg bluetooth; giving the app an ATT MTU of %d, as a phone that negotiated it would", mtu)
+	}
 	go func() {
 		for {
 			conn, err := l.Accept()
@@ -181,7 +188,11 @@ func (r *simRadio) connect(c *simClient) {
 		log.Infof("pkg bluetooth; ** New connection from: %s", c.bundle)
 		r.ble.Connected()
 	}
-	c.send(map[string]interface{}{"type": "didConnect", "id": r.id})
+	msg := map[string]interface{}{"type": "didConnect", "id": r.id}
+	if r.mtu > 0 {
+		msg["mtu"] = r.mtu
+	}
+	c.send(msg)
 }
 
 func (r *simRadio) serviceID() string { return r.id + ":" + podServiceUUID }
@@ -372,6 +383,11 @@ func (r *simRadio) notify(uuid string, packet Packet) error {
 		return errors.New("not connected")
 	case !subscribed:
 		return errors.New("not subscribed")
+	}
+	// A notification holds MTU-3 bytes; standing for a phone with a small
+	// MTU, the pod is held to it as a peripheral would be.
+	if r.mtu > 3 && len(packet) > r.mtu-3 {
+		packet = packet[:r.mtu-3]
 	}
 	c.send(map[string]interface{}{"type": "didUpdateValue", "id": r.id, "characteristicId": charID,
 		"value": base64.StdEncoding.EncodeToString(packet), "error": ""})

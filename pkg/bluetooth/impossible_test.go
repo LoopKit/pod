@@ -53,7 +53,7 @@ func TestSimRadioPairsAndCarriesBothCharacteristics(t *testing.T) {
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "impossible.sock")
 	const id = "11111111-2222-4333-8444-555555555555"
-	b, err := New(mode.Dash, func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil) })
+	b, err := New(mode.Dash, func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil, 0) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -151,7 +151,7 @@ func TestSimRadioServesAnOmnipod5(t *testing.T) {
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "impossible.sock")
 	const id = "11111111-2222-4333-8444-555555555555"
-	b, err := New(mode.O5, func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil) })
+	b, err := New(mode.O5, func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil, 0) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -210,7 +210,7 @@ func TestSimRadioHoldsAConnectForItsStartDelay(t *testing.T) {
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "impossible.sock")
 	const id = "11111111-2222-4333-8444-555555555555"
-	b, err := New(mode.Dash, func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil) })
+	b, err := New(mode.Dash, func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil, 0) })
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -243,5 +243,37 @@ func TestSimRadioHoldsAConnectForItsStartDelay(t *testing.T) {
 	time.Sleep(400 * time.Millisecond)
 	if b.IsConnected() {
 		t.Fatal("a cancelled connect completed")
+	}
+}
+
+// With an MTU, the pod gives it to the app on connecting, for ImpossiBLE to
+// cut writes as CoreBluetooth would; without one it gives none.
+func TestSimRadioGivesItsMTUOnConnecting(t *testing.T) {
+	for _, mtu := range []int{0, 185} {
+		dir, err := ioutil.TempDir("/tmp", "podsim")
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer os.RemoveAll(dir)
+		path := filepath.Join(dir, "impossible.sock")
+		const id = "11111111-2222-4333-8444-555555555555"
+		if _, err := New(mode.O5, func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil, mtu) }); err != nil {
+			t.Fatal(err)
+		}
+		conn, err := net.Dial("unix", path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer conn.Close()
+		app := &fakeApp{t: t, conn: conn, in: bufio.NewScanner(conn)}
+		app.send(map[string]interface{}{"type": "hello", "bundleId": "org.nightscout.Trio", "pid": 0})
+		app.send(map[string]interface{}{"type": "connect", "id": id})
+		got, given := app.expect("didConnect")["mtu"]
+		if mtu == 0 && given {
+			t.Errorf("no MTU set, but the app was given %v", got)
+		}
+		if mtu != 0 && got != float64(mtu) {
+			t.Errorf("MTU %d set, the app was given %v", mtu, got)
+		}
 	}
 }

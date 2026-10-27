@@ -22,6 +22,7 @@ func main() {
 	var apiAddr = flag.String("api", ":8080", "address of the control panel and its API")
 	var transport = flag.String("transport", "ble", "ble (a Linux Bluetooth adapter) or impossible (ImpossiBLE's socket, for an app in the iOS Simulator)")
 	var socket = flag.String("socket", "/tmp/impossible.sock", "ImpossiBLE socket for -transport impossible")
+	var simMTU = flag.Int("sim-mtu", 0, "for -transport impossible: the ATT MTU to give the app, as a phone that negotiated it would (an iPhone gave a Pi 185); 0 for none")
 
 	flag.Parse()
 
@@ -72,7 +73,7 @@ func main() {
 		attach = func(b *bluetooth.Ble) (bluetooth.Radio, error) { return bluetooth.NewGattRadio(b, state.Id) }
 	case "impossible":
 		attach = func(b *bluetooth.Ble) (bluetooth.Radio, error) {
-			return bluetooth.NewSimRadio(b, *socket, state.PeripheralID, state.Id)
+			return bluetooth.NewSimRadio(b, *socket, state.PeripheralID, state.Id, *simMTU)
 		}
 	default:
 		log.Fatalf("transport %q: want ble or impossible", *transport)

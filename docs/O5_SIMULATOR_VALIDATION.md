@@ -137,6 +137,16 @@ Run the same wizard with `./pod -transport impossible -mode dash -fresh` and Pod
 Omnipod DASH: pairing, priming, cannula insertion, a bolus, a temp basal and deactivation
 must work as on LoopKit/pod `main`.
 
+## A phone with a small ATT MTU
+
+`-sim-mtu 185` stands for an iPhone that negotiated an ATT MTU of 185, as one did with a
+pod on a Raspberry Pi: the app's writes without response are cut to 182 bytes, as
+CoreBluetooth cuts them, and so are the pod's notifications. An Omnipod 5's 244-byte
+packets need 247, so pairing fails at SPS2.1. It needs ImpossiBLE built with g7sim's
+`impossible-patches/0008` (for now on the `impossible-att-mtu` branch of
+[jwoglom/g7sim](https://github.com/jwoglom/g7sim)); without it, the app's writes go through
+whole.
+
 ## With a simulated CGM too
 
 g7sim's `impossible-mux` lets one app use both providers:
