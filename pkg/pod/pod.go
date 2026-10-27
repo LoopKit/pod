@@ -282,6 +282,18 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 			return
 		}
 		if didTimeout {
+			// A pod being activated holds its connection: the user is
+			// filling, priming, attaching and inserting it, which takes
+			// longer than this, and a real pod does not hang up partway
+			// through. Only a pod that is running drops an idle link, the
+			// way some DASH pods do every few minutes.
+			p.mtx.Lock()
+			activating := p.state.PodProgress < response.PodProgressRunningAbove50U
+			p.mtx.Unlock()
+			if activating {
+				log.Infof("pkg pod; idle while being activated — holding the connection")
+				continue
+			}
 			p.ble.ShutdownConnection()
 			go func() {
 				p.StartAcceptingCommands()
