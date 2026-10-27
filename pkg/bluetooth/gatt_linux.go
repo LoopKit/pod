@@ -2,6 +2,7 @@ package bluetooth
 
 import (
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -38,6 +39,12 @@ var DefaultServerOptions = []gatt.Option{
 
 // NewGattRadio serves the pod from the first Bluetooth adapter.
 func NewGattRadio(b *Ble, podId []byte) (Radio, error) {
+	// An Omnipod 5 advertises one 128-bit service UUID and needs a
+	// 247-byte ATT MTU; the vendored gatt library advertises neither, so
+	// say so rather than advertise something no phone will answer.
+	if b.profile.Mode.IsO5() {
+		return nil, errors.New("-mode o5 needs -transport impossible: this Bluetooth stack advertises only 16-bit service UUIDs")
+	}
 	d, err := gatt.NewDevice(DefaultServerOptions...)
 	if err != nil {
 		log.Fatalf("pkg bluetooth; failed to open device, err: %s", err)
@@ -131,7 +138,7 @@ func (r *gattRadio) advertise() error {
 }
 
 // Advertise updates the advertisement; paypal/gatt needs no StopAdvertising first.
-func (r *gattRadio) Advertise(podId []byte) error {
+func (r *gattRadio) Advertise(podId []byte, pdmId uint32) error {
 	r.advertMtx.Lock()
 	r.podId = podId
 	r.advertMtx.Unlock()

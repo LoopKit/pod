@@ -14,6 +14,8 @@ Fake pod implementation
 
 * It can serve an app in the iOS Simulator instead of a phone; see [Run against the iOS Simulator](#run-against-the-ios-simulator).
 
+* It simulates a DASH pod by default, or an Omnipod 5 with `-mode o5`; see [Simulate an Omnipod 5](#simulate-an-omnipod-5).
+
 Requirements:
 1. Version of iOS code (Loop app) that will interact with this simulator - Loop dev branch or FreeAPS freeaps_dev branch
 2. Raspberry pi with Bluetooth BLE (using a pi3b or pi4 right now)
@@ -64,6 +66,7 @@ To restore communication between the app and an existing simulated dash pod, iss
 ```
 
 To change the reporting level, add one of these two flags:
+* `-mode dash` (the default) or `-mode o5` to choose the pod to simulate
 * `-v` to make reporting more verbose (Trace Level)
 * `-q` to make reporting less verbose (recommended)
 * no extra flag - medium verbose (Debug Level)
@@ -107,6 +110,75 @@ Its advertisement shows a fault or a firing alert, as a real pod's does: the 2nd
 panel reaches a backgrounded Loop the way a real one does, through its scan for `C00A`; with `impossible-mux -suspend`
 the advertisement wakes the suspended app. A real pod's fault is final, and Loop treats it so: clearing the fault here
 doesn't restart Loop's scan for `C00A`. Relaunch Loop before testing another fault.
+
+## Simulate an Omnipod 5
+
+`-mode o5` makes the pod an Omnipod 5 instead of a DASH. The mode is kept in the state
+file, so restarting the simulator does not change the pod the phone paired with; a
+different `-mode` is then ignored with a warning, and `-fresh` starts a new pod.
+
+```
+./pod -transport impossible -mode o5 -fresh
+```
+
+An Omnipod 5 differs from a DASH in what it advertises and how it talks:
+
+* one 128-bit service UUID, `CE1F923D-C539-48EA-7300-0A<controller id>00`, holding the
+  controller it paired with (`FFFFFFFE` before pairing, and a trailing `02` instead of
+  `00` while the pod wants attention, which is how a backgrounded app hears about a fault)
+* the data characteristic `1A7E2443` rather than `1A7E2442`
+* 244-byte packets and no RTS/CTS handshake: a message begins with its first packet, and
+  whoever received it answers SUCCESS
+* a longer pairing exchange, in which each side shows an X.509 certificate and signs what
+  both have said (SPS0, SPS1, SPS2.1, SPS2), ending in the same long-term key and the same
+  EAP-AKA session a DASH uses
+* a real CRC16 on every response, which the phone checks for an Omnipod 5 and ignores for
+  a DASH
+* a signature on every command that starts or stops insulin. One that arrives unsigned, or
+  signed by anything but the controller the pod paired with, is refused with error `0x2A`
+  as a real pod refuses it, and the control panel counts it under "Signed commands
+  rejected" — anything above zero is worth looking into.
+
+The control panel shows the pod type and the controller alongside the rest.
+
+`-mode o5` needs `-transport impossible`: the Linux Bluetooth stack here advertises only
+16-bit service UUIDs and does not negotiate the 247-byte ATT MTU an Omnipod 5 packet needs.
+
+### Registration data for the app
+
+OmnipodKit will not begin an Omnipod 5 pairing without a controller signing key and
+certificate chain. On a phone it downloads them, which needs Apple's App Attest and so
+fails in the iOS Simulator. `cmd/o5keypair` makes a self-signed set instead:
+
+```
+go run ./cmd/o5keypair -swift > O5Data.swift     # to build into OmnipodKit
+go run ./cmd/o5keypair > o5keypair.json          # the same data as JSON
+```
+
+Copy `O5Data.swift` into `LoopWorkspace/OmnipodKit/OmnipodKit/` and build. It defines
+`O5RegistrationDataInstall`, which OmnipodKit looks up with `dlsym` at start, so the data
+is in place before any pod is paired. OmnipodKit's project uses a synchronized folder, so
+Xcode picks the file up on its own. Keep it out of git: it pairs with this simulator and
+with nothing else, because neither side validates the other's certificate chain — each
+only reads the public key out of the certificate to check the other's signature.
+
+### Pair it with Loop
+
+Loop must come from LoopWorkspace `next-dev`, which pins the OmnipodKit that talks to a
+simulated pod when it finds ImpossiBLE. Build it for a simulator, start the pod, then
+launch Loop with ImpossiBLE's library injected:
+
+```
+./pod -transport impossible -mode o5 -fresh
+SIMCTL_CHILD_DYLD_INSERT_LIBRARIES=/path/to/libImpossiBLE.dylib \
+    xcrun simctl launch booted <Loop's bundle id>
+```
+
+In Loop: Settings -> Insulin Pump -> Add Pump -> Omnipod, then Pod Type -> Omnipod 5. The
+setup screen should say it is ready to pair; if it offers to download a certificate
+instead, `O5Data.swift` was not built in. The pod log then shows the controller's HELLO,
+the pairing rounds, `the phone's SPS2 signature verifies`, the EAP-AKA session, the setup
+commands and the prime bolus.
 
 # Original README.md
 

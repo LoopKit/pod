@@ -5,6 +5,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/avereha/pod/pkg/aid"
 	"github.com/avereha/pod/pkg/bluetooth"
 	"github.com/avereha/pod/pkg/command"
 	"github.com/avereha/pod/pkg/eap"
@@ -32,6 +33,7 @@ type PodMsgBody struct {
 type Pod struct {
 	ble            *bluetooth.Ble
 	state          *PODState
+	aid            *aid.Store
 	mtx            sync.Mutex
 	webMessageHook func([]byte)
 
@@ -49,6 +51,7 @@ func New(ble *bluetooth.Ble, state *PODState) *Pod {
 	ret := &Pod{
 		ble:   ble,
 		state: state,
+		aid:   aid.NewStore(),
 	}
 	ret.takeSnapshot()
 	return ret
@@ -83,6 +86,17 @@ func (p *Pod) StartAcceptingCommands() {
 	log.Infof("pkg pod; Listening for commands")
 	firstCmd, _ := p.ble.ReadCmd()
 	log.Infof("pkg pod; got first command: as string: %s", firstCmd)
+	if pdmId, ok := bluetooth.O5PdmIdFromHello(firstCmd); ok {
+		log.Infof("pkg pod; HELLO from controller %08x", pdmId)
+		if p.isO5() {
+			// An Omnipod 5 puts its controller's id in the one service
+			// UUID it advertises, so the phone can find its own pod.
+			p.mtx.Lock()
+			p.state.PdmId = pdmId
+			p.mtx.Unlock()
+			p.ble.SetPdmId(pdmId)
+		}
+	}
 
 	p.ble.StartMessageLoop()
 
@@ -109,7 +123,22 @@ func (p *Pod) readSetup() (*message.Message, bool) {
 	}
 }
 
+// isO5 says whether this pod is simulating an Omnipod 5.
+func (p *Pod) isO5() bool { return p.ble.Profile().Mode.IsO5() }
+
+// product is what the pod reports in its version responses.
+func (p *Pod) product() response.Product {
+	if p.isO5() {
+		return response.Omnipod5Product()
+	}
+	return response.DashProduct()
+}
+
 func (p *Pod) StartActivation() {
+	if p.isO5() {
+		p.startO5Activation()
+		return
+	}
 
 	pair := &pair.Pair{}
 	msg, ok := p.readSetup()
@@ -270,11 +299,34 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		// Lock mutex before we start using/modifying state
 		p.mtx.Lock()
 
+		// A signed message's signature covers its header and its payload
+		// while that is still encrypted, so both have to be taken now:
+		// decrypting replaces the payload in place.
+		msgType, signature, signingInput := msg.Type, msg.Signature, msg.SigningInput()
+
 		decrypted, err := encrypt.DecryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, msg)
 		if err != nil {
 			log.Fatalf("pkg pod; could not decrypt message: %s", err)
 		}
 		p.state.NonceSeq++
+
+		// An Omnipod 5 is sent its setup commands on this same transport
+		// before it is set up. They are not command blocks, and the phone
+		// does not acknowledge the answer.
+		if p.isO5() && aid.Looks(decrypted.Payload) {
+			ok := p.handleAidCommand(decrypted.Payload, msg.Source, msg.Destination, msg.SequenceNumber)
+			p.state.Save()
+			p.takeSnapshot()
+			p.mtx.Unlock()
+			if !ok {
+				log.Errorf("pkg pod; could not answer the AID command — re-establishing session")
+				p.ble.ShutdownConnection()
+				go p.StartAcceptingCommands()
+				return
+			}
+			p.notifyStateChange()
+			continue
+		}
 
 		cmd, err := command.Unmarshal(decrypted.Payload)
 		if err != nil {
@@ -290,8 +342,8 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		data = decrypted.Payload
 		n = len(data)
 		log.Debugf("pkg pod; len = %d", n)
-		if n < 16 {
-			log.Fatalf("pkg pod; decrypted. Payload too short")
+		if n < 19 {
+			log.Fatalf("pkg pod; decrypted payload of %d bytes is too short to hold a command", n)
 		}
 		pMsg.MsgBodyCommand = data[13 : n-5]
 		if data[13] == 0x1c {
@@ -299,19 +351,34 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		}
 		log.Tracef("pkg pod; command pod message body = %x", pMsg.MsgBodyCommand)
 
-		p.handleCommand(cmd)
-
 		var rsp response.Response
-		if cmd.IsResponseHardcoded() {
-			rsp, err = cmd.GetResponse()
-			if err != nil {
-				log.Fatalf("pkg pod; could not get command response: %s", err)
-			}
+		if refusal := p.checkO5Signature(cmd, msgType, signature, signingInput); refusal != nil {
+			// The command is not carried out: a real pod answers an
+			// unsigned insulin or cancel command with an error and leaves
+			// its delivery alone.
+			rsp = refusal
 		} else {
-			rsp = p.getResponse(cmd)
+			p.handleCommand(cmd)
+
+			if cmd.IsResponseHardcoded() {
+				rsp, err = cmd.GetResponse()
+				if err != nil {
+					log.Fatalf("pkg pod; could not get command response: %s", err)
+				}
+				// The phone checks the product id against the pod type the
+				// user chose, and decodes the lot number for the UI.
+				switch r := rsp.(type) {
+				case *response.VersionResponse:
+					r.Product = p.product()
+				case *response.SetUniqueID:
+					r.Product = p.product()
+				}
+			} else {
+				rsp = p.getResponse(cmd)
+			}
 		}
 
-		if cmd.GetType() == command.SET_UNIQUE_ID {
+		if _, refused := rsp.(*response.ErrorResponse); !refused && cmd.GetType() == command.SET_UNIQUE_ID {
 			// Set the unique ID
 			log.Tracef("SET_UNIQUE_ID cmd.GetPayload() %x", cmd.GetPayload())
 			uniqueId := cmd.GetPayload()
@@ -386,12 +453,24 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 	}
 }
 
+// encryptAndSend encrypts a message under the session key and writes it
+// to the phone, advancing the nonce the way an answer does.
+func (p *Pod) encryptAndSend(msg *message.Message) error {
+	out, err := encrypt.EncryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, msg)
+	if err != nil {
+		return err
+	}
+	p.state.NonceSeq++
+	p.ble.WriteMessage(out)
+	return nil
+}
+
 func (p *Pod) makeGeneralStatusResponse() response.Response {
 	log.Debugf("pkg pod; General status response LastProgSeqNum = %d", p.state.LastProgSeqNum)
 
 	var now = time.Now()
 
-	return &response.GeneralStatusResponse {
+	return &response.GeneralStatusResponse{
 		LastProgSeqNum:      p.state.LastProgSeqNum,
 		Reservoir:           p.state.Reservoir,
 		Alerts:              p.state.ActiveAlertSlots,
@@ -410,7 +489,7 @@ func (p *Pod) makeDetailedStatusResponse() response.Response {
 
 	var now = time.Now()
 
-	return &response.DetailedStatusResponse {
+	return &response.DetailedStatusResponse{
 		LastProgSeqNum:      p.state.LastProgSeqNum,
 		Reservoir:           p.state.Reservoir,
 		Alerts:              p.state.ActiveAlertSlots,
@@ -429,17 +508,17 @@ func (p *Pod) makeDetailedStatusResponse() response.Response {
 
 func (p *Pod) makeType1StatusResponse() response.Response {
 
-	return &response.Type1StatusResponse {
-		TriggeredAlerts:     p.state.TriggerTimes,
+	return &response.Type1StatusResponse{
+		TriggeredAlerts: p.state.TriggerTimes,
 	}
 }
 
 func (p *Pod) makeType3StatusResponse() response.Response {
 
-	return &response.Type3StatusResponse {
-		FaultEvent:          p.state.FaultEvent,
-		FaultEventTime:      p.state.FaultTime,
-		MinutesActive:       p.state.MinutesActive(),
+	return &response.Type3StatusResponse{
+		FaultEvent:     p.state.FaultEvent,
+		FaultEventTime: p.state.FaultTime,
+		MinutesActive:  p.state.MinutesActive(),
 	}
 }
 
@@ -447,14 +526,14 @@ func (p *Pod) makeType5StatusResponse() response.Response {
 
 	var activationTime = p.state.ActivationTime
 
-	return &response.Type5StatusResponse {
-		FaultEvent:          p.state.FaultEvent,
-		FaultEventTime:      p.state.FaultTime,
-		Year:                uint8(activationTime.Year() - 2000),
-		Month:               uint8(activationTime.Month()),
-		Day:                 uint8(activationTime.Day()),
-		Hour:                uint8(activationTime.Hour()),
-		Minute:              uint8(activationTime.Minute()),
+	return &response.Type5StatusResponse{
+		FaultEvent:     p.state.FaultEvent,
+		FaultEventTime: p.state.FaultTime,
+		Year:           uint8(activationTime.Year() - 2000),
+		Month:          uint8(activationTime.Month()),
+		Day:            uint8(activationTime.Day()),
+		Hour:           uint8(activationTime.Hour()),
+		Minute:         uint8(activationTime.Minute()),
 	}
 }
 
@@ -462,7 +541,7 @@ func (p *Pod) getResponse(cmd command.Command) response.Response {
 	var rsp response.Response
 
 	getStatus, isStatusRequest := cmd.(*command.GetStatus)
-	if p.state.MinutesActive() >= 80 * 60 && p.state.FaultEvent == 0 {
+	if p.state.MinutesActive() >= 80*60 && p.state.FaultEvent == 0 {
 		p.state.FaultEvent = 0x1C // 0x1C = exceeded maximum pod life of 80 hours
 	}
 	if !isStatusRequest || getStatus.RequestType == 0 || getStatus.RequestType == 7 {

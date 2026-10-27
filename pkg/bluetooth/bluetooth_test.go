@@ -36,12 +36,12 @@ func (w *wire) NotifyData(p Packet) error {
 	return nil
 }
 
-func (w *wire) Advertise([]byte) error           { return nil }
+func (w *wire) Advertise([]byte, uint32) error   { return nil }
 func (w *wire) AdvertiseState(AdvertState) error { return nil }
 func (w *wire) Disconnect()                      {}
 
 func newEnd(t *testing.T, w *wire) *Ble {
-	b, err := New(func(*Ble) (Radio, error) { return w, nil })
+	b, err := New(func(*Ble) (Radio, error) { return w, nil }, ProfileFor(ModeDash))
 	if err != nil {
 		t.Fatal(err)
 	}

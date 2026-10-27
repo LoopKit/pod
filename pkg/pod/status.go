@@ -26,7 +26,16 @@ var progressNames = map[response.PodProgress]string{
 
 // Status is the pod as the control panel shows it.
 type Status struct {
-	ID                  string    `json:"id"`
+	ID string `json:"id"`
+	// Mode is "dash" or "o5" and PodType names it for a reader.
+	Mode    string `json:"mode"`
+	PodType string `json:"podType"`
+	// Controller is the phone the pod paired with, which an Omnipod 5
+	// also advertises. Empty until it has paired.
+	Controller string `json:"controller"`
+	// SignedRejected counts the commands refused for want of a good
+	// signature. Anything above zero wants looking into.
+	SignedRejected      uint32    `json:"signedRejected"`
 	Paired              bool      `json:"paired"`
 	Connected           bool      `json:"connected"`
 	Progress            int       `json:"progress"`
@@ -80,8 +89,17 @@ func (p *Pod) Status() Status {
 	if len(s.Id) == 4 {
 		id = fmt.Sprintf("%08X", s.Id)
 	}
+	controller := ""
+	if s.PdmId != 0 {
+		controller = fmt.Sprintf("%08X", s.PdmId)
+	}
+	mode := p.ble.Profile().Mode
 	return Status{
 		ID:                  id,
+		Mode:                string(mode),
+		PodType:             mode.Description(),
+		Controller:          controller,
+		SignedRejected:      s.SignedRejected,
 		Paired:              s.LTK != nil,
 		Connected:           p.ble.IsConnected(),
 		Progress:            int(s.PodProgress),

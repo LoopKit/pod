@@ -51,7 +51,7 @@ const indexHTML = `<!doctype html>
 </head>
 <body>
 <header>
-  <h1>DASH pod</h1>
+  <h1 id="podType">pod</h1>
   <span class="meta" id="podid"></span>
   <span class="chip" id="link" role="status">—</span>
 </header>
@@ -71,6 +71,8 @@ const indexHTML = `<!doctype html>
       <dt>Bolus</dt><dd id="bolus">—</dd>
       <dt>Alerts</dt><dd id="alertsNow">—</dd>
       <dt>Fault</dt><dd id="faultNow">—</dd>
+      <dt>Controller</dt><dd id="controller">—</dd>
+      <dt id="rejectedLabel" hidden>Signed commands rejected</dt><dd id="rejected" hidden>—</dd>
     </dl>
   </section>
 
@@ -303,7 +305,16 @@ function chip(el, text, cls){ el.textContent=text; el.className='chip '+(cls||''
 
 function show(s){
   last = s;
+  document.title = s.podType + ' simulator';
+  $('podType').textContent = s.podType + ' pod';
   $('podid').textContent = s.id ? 'id '+s.id : (s.paired ? '' : 'not paired');
+  $('controller').textContent = s.controller ? s.controller : 'not paired';
+  // An Omnipod 5 must have a good signature on every insulin, cancel and
+  // deactivate command, so a refusal is worth showing.
+  const anyRejected = s.signedRejected > 0;
+  $('rejectedLabel').hidden = !anyRejected;
+  $('rejected').hidden = !anyRejected;
+  if(anyRejected){ $('rejected').textContent = s.signedRejected; $('rejected').className = 'bad'; }
   chip($('link'), s.connected ? 'connected' : 'not connected', s.connected ? 'ok' : '');
   $('reservoir').textContent = Math.round(s.reservoir*100)/100;
   const p = s.fault ? ['bad'] : s.progress>=8 && s.progress<=9 ? ['ok'] : ['warn'];
