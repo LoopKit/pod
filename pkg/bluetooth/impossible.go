@@ -397,6 +397,9 @@ func (r *simRadio) AdvertiseState(state AdvertState) error {
 	return nil
 }
 
+// LinkMTU is 0: ImpossiBLE carries whole packets, so it has no ATT MTU.
+func (r *simRadio) LinkMTU() int { return 0 }
+
 // Disconnect is the pod hanging up.
 func (r *simRadio) Disconnect() {
 	r.mu.Lock()

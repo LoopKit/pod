@@ -25,6 +25,7 @@ func (silentRadio) NotifyData(bluetooth.Packet) error          { return nil }
 func (silentRadio) Advertise([]byte, uint32) error             { return nil }
 func (silentRadio) AdvertiseState(bluetooth.AdvertState) error { return nil }
 func (silentRadio) Disconnect()                                {}
+func (silentRadio) LinkMTU() int                               { return 0 }
 
 func testPod(t *testing.T, mode bluetooth.Mode) *Pod {
 	t.Helper()

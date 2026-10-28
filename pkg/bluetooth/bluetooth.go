@@ -37,6 +37,9 @@ type Radio interface {
 	Advertise(podId []byte, pdmId uint32) error
 	AdvertiseState(state AdvertState) error
 	Disconnect()
+	// LinkMTU is the ATT MTU the phone negotiated, or 0 when the
+	// transport has none to report.
+	LinkMTU() int
 }
 
 const AdvertisedName = " :: Fake POD ::"
@@ -336,6 +339,29 @@ func (b *Ble) servingCurrentConnection() bool {
 
 func (b *Ble) ShutdownConnection() {
 	b.radio.Disconnect()
+}
+
+// MTUShortfall reports a link too small to carry a packet of this profile.
+// The phone fragments a message into packets but does not fragment a packet,
+// so a short link truncates every write silently, and pairing stalls on the
+// first message that needs more than one packet. Returns nil when the link
+// is big enough, and when the radio has no MTU to report.
+func (b *Ble) MTUShortfall() error {
+	mtu := b.radio.LinkMTU()
+	if mtu == 0 {
+		return nil
+	}
+	needed := b.profile.Layout.MaxPayloadSize + 3 // the 3-byte ATT write header
+	if mtu >= needed {
+		return nil
+	}
+	return fmt.Errorf("the phone negotiated an ATT MTU of %d, below the %d an %s packet needs, "+
+		"so its writes would be truncated. A phone asks for more only of a Bluetooth 4.2 or "+
+		"later radio: check this one with `hciconfig hci0 version`, and if it is older, plug "+
+		"in a 4.2+ dongle and name it with -hci (it will not be hci0). On a 4.2+ radio, "+
+		"`sudo hcitool -i hci0 cmd 0x08 0x0024 fb 00 48 03` is worth a try. Or run the app in "+
+		"the iOS Simulator over -transport impossible, which has no MTU",
+		mtu, needed, b.profile.Mode.Description())
 }
 
 func (b *Ble) WriteMessage(message *message.Message) {

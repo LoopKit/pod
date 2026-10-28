@@ -39,6 +39,7 @@ func (w *wire) NotifyData(p Packet) error {
 func (w *wire) Advertise([]byte, uint32) error   { return nil }
 func (w *wire) AdvertiseState(AdvertState) error { return nil }
 func (w *wire) Disconnect()                      {}
+func (w *wire) LinkMTU() int                     { return 0 }
 
 func newEnd(t *testing.T, w *wire) *Ble {
 	b, err := New(func(*Ble) (Radio, error) { return w, nil }, ProfileFor(ModeDash))
@@ -102,5 +103,50 @@ func TestANewConnectionReadsOnlyItsOwnPackets(t *testing.T) {
 	}
 	if !bytes.Equal(got.Payload, sent.Payload) {
 		t.Fatalf("read payload % x, want % x", got.Payload, sent.Payload)
+	}
+}
+
+// mtuRadio reports a fixed ATT MTU and goes nowhere else.
+type mtuRadio struct{ mtu int }
+
+func (mtuRadio) NotifyCmd(Packet) error           { return nil }
+func (mtuRadio) NotifyData(Packet) error          { return nil }
+func (mtuRadio) Advertise([]byte, uint32) error   { return nil }
+func (mtuRadio) AdvertiseState(AdvertState) error { return nil }
+func (mtuRadio) Disconnect()                      {}
+func (r mtuRadio) LinkMTU() int                   { return r.mtu }
+
+// A phone fragments a message into packets but never fragments a packet, so
+// a link that cannot carry one truncates every write silently. The pod
+// refuses to pair over such a link rather than stall on the first message
+// that needs more than one packet.
+func TestMTUShortfall(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		mode  Mode
+		mtu   int
+		short bool
+	}{
+		{"what a Bluetooth 4.0 adapter got from an iPhone", ModeO5, 185, true},
+		{"the 23-byte ATT default", ModeO5, 23, true},
+		{"exactly a packet and its header", ModeO5, 247, false},
+		{"what a Pi 4's own radio got from an iPhone 11", ModeO5, 256, false},
+		{"a DASH packet fits the ATT default", ModeDash, 23, false},
+		{"a radio with no MTU to report", ModeO5, 0, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			radio := mtuRadio{c.mtu}
+			b, err := New(func(*Ble) (Radio, error) { return radio, nil }, ProfileFor(c.mode))
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = b.MTUShortfall()
+			if c.short && err == nil {
+				t.Fatalf("an MTU of %d carries no %s packet, but it was accepted", c.mtu, c.mode)
+			}
+			if !c.short && err != nil {
+				t.Fatalf("an MTU of %d was refused: %s", c.mtu, err)
+			}
+		})
 	}
 }

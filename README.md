@@ -18,7 +18,9 @@ Fake pod implementation
 
 Requirements:
 1. Version of iOS code (Loop app) that will interact with this simulator - Loop dev branch or FreeAPS freeaps_dev branch
-2. Raspberry pi with Bluetooth BLE (using a pi3b or pi4 right now)
+2. Raspberry pi with Bluetooth BLE (using a pi3b or pi4 right now). For `-mode o5` the
+   radio must be Bluetooth 4.2 or later, which a pi3b's is not; see
+   [An Omnipod 5 over real Bluetooth needs a 4.2+ radio](#an-omnipod-5-over-real-bluetooth-needs-a-42-radio)
 3. The user must have sudo privilege on the pi
 4. Install the go language on your device (search internet for procedure)
 
@@ -118,7 +120,9 @@ file, so restarting the simulator does not change the pod the phone paired with;
 different `-mode` is then ignored with a warning, and `-fresh` starts a new pod.
 
 ```
-./pod -transport impossible -mode o5 -fresh
+./pod -transport impossible -mode o5 -fresh   # an app in the iOS Simulator
+./pod -mode o5 -fresh                         # a phone, over a 4.2+ Bluetooth adapter
+./pod -mode o5 -fresh -hci 1                  # ... over the dongle on hci1
 ```
 
 An Omnipod 5 differs from a DASH in what it advertises and how it talks:
@@ -141,8 +145,56 @@ An Omnipod 5 differs from a DASH in what it advertises and how it talks:
 
 The control panel shows the pod type and the controller alongside the rest.
 
-`-mode o5` needs `-transport impossible`: the Linux Bluetooth stack here advertises only
-16-bit service UUIDs and does not negotiate the 247-byte ATT MTU an Omnipod 5 packet needs.
+### An Omnipod 5 over real Bluetooth needs a 4.2+ radio
+
+Either transport serves an Omnipod 5, but a real Bluetooth adapter has to be new enough.
+An Omnipod 5 packet is 244 bytes and needs a 247-byte ATT MTU; a phone asks for one that
+large only of a **Bluetooth 4.2 or later** radio, and asks for 185 of anything older. The
+phone fragments a message into packets but never fragments a packet, so on a short link
+every write is silently truncated. Pairing then fails at SPS2.1, the first message that
+needs more than one packet. The pod refuses such a link rather than stall on it, and says
+so in the log.
+
+This rules out a Pi 3B's or Zero W's own radio, and the Pi 3B+, 4 and 5 are fine:
+
+| Board | Bluetooth | Omnipod 5 over real Bluetooth |
+| --- | --- | --- |
+| Pi 3B, Zero W | 4.1 | no — needs a dongle |
+| Pi 3B+ | 4.2 | yes |
+| Pi 4, Pi 5 | 5.0 | yes |
+
+Check what you have, and what a phone settled on:
+
+```
+hciconfig hci0 version                 # "HCI Version: 4.1" is too old
+sudo hcitool -i hci0 lefeatures        # look for LE Data Packet Length Extension
+```
+
+The simulator logs the MTU as soon as the phone has negotiated one:
+
+```
+INFO  pkg bluetooth; the phone negotiated an ATT MTU of 256
+ERROR pkg bluetooth; the phone negotiated an ATT MTU of 185, below the 247 an Omnipod 5 ...
+```
+
+On an older radio, a **Bluetooth 4.2+ USB dongle** is the fix. It will not be `hci0`, and
+the simulator takes the first adapter with LE support unless told otherwise, so name it:
+
+```
+hciconfig                              # find the dongle, usually hci1
+./pod -mode o5 -fresh -hci 1
+```
+
+On a 4.2+ radio that still settles on 185, telling the controller to offer a long data
+length at connection setup is worth a try (the command does not exist before 4.2):
+
+```
+sudo hcitool -i hci0 cmd 0x08 0x0024 fb 00 48 03   # LE Write Suggested Default Data Length
+```
+
+Failing all of that, `-transport impossible` serves an app in the iOS Simulator over a
+socket, which carries whole packets and has no ATT MTU, so the radio stops mattering —
+see [Run against the iOS Simulator](#run-against-the-ios-simulator).
 
 ### Registration data for the app
 

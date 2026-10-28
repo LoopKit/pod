@@ -32,6 +32,7 @@ func (w *phoneWire) NotifyData(p Packet) error {
 func (w *phoneWire) Advertise([]byte, uint32) error   { return nil }
 func (w *phoneWire) AdvertiseState(AdvertState) error { return nil }
 func (w *phoneWire) Disconnect()                      {}
+func (w *phoneWire) LinkMTU() int                     { return 0 }
 
 func (w *phoneWire) nextCmd(t *testing.T) Packet {
 	t.Helper()

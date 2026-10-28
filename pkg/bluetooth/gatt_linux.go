@@ -27,21 +27,32 @@ type gattRadio struct {
 
 	dataNotifier    gatt.Notifier
 	dataNotifierMtx sync.Mutex
+
+	mtuMtx  sync.Mutex
+	linkMTU int // what reportMTU saw the phone settle on; 0 until it has
 }
 
-var DefaultServerOptions = []gatt.Option{
-	gatt.LnxMaxConnections(1),
-	gatt.LnxDeviceID(-1, true),
-	gatt.LnxSetAdvertisingParameters(&cmd.LESetAdvertisingParameters{
-		AdvertisingIntervalMin: 0x00f4,
-		AdvertisingIntervalMax: 0x00f4,
-		AdvertisingChannelMap:  0x7,
-	}),
+// ServerOptions is how the pod serves itself from adapter hci<n>, or from
+// the first one with LE support when n is negative.
+func ServerOptions(hci int) []gatt.Option {
+	return []gatt.Option{
+		gatt.LnxMaxConnections(1),
+		gatt.LnxDeviceID(hci, true),
+		gatt.LnxSetAdvertisingParameters(&cmd.LESetAdvertisingParameters{
+			AdvertisingIntervalMin: 0x00f4,
+			AdvertisingIntervalMax: 0x00f4,
+			AdvertisingChannelMap:  0x7,
+		}),
+	}
 }
 
-// NewGattRadio serves the pod from the first Bluetooth adapter.
-func NewGattRadio(b *Ble, podId []byte) (Radio, error) {
-	d, err := gatt.NewDevice(DefaultServerOptions...)
+// NewGattRadio serves the pod from Bluetooth adapter hci<hci>, or from the
+// first one with LE support when hci is negative. Which adapter matters:
+// an Omnipod 5 needs a 247-byte ATT MTU, which a phone asks for only of a
+// Bluetooth 4.2 or later radio, so a Pi 3B's own 4.1 radio will not do and
+// a dongle has to be named here rather than left to chance.
+func NewGattRadio(b *Ble, podId []byte, hci int) (Radio, error) {
+	d, err := gatt.NewDevice(ServerOptions(hci)...)
 	if err != nil {
 		log.Fatalf("pkg bluetooth; failed to open device, err: %s", err)
 	}
@@ -52,8 +63,9 @@ func NewGattRadio(b *Ble, podId []byte) (Radio, error) {
 			fmt.Println("pkg bluetooth; ** New connection from: ", c.ID())
 			r.central = c
 			// The phone drives the ATT MTU exchange and the pod answers with
-			// its own maximum; log what they settled on, since an Omnipod 5
+			// its own maximum; record what they settled on, since an Omnipod 5
 			// packet needs 247 and a smaller one truncates pairing.
+			r.setLinkMTU(0)
 			go r.reportMTU(c)
 			b.Connected()
 		}),
@@ -144,23 +156,42 @@ func (r *gattRadio) advertise() error {
 	return r.device.AdvertiseNameAndServices(r.profile.AdvertisedName(pdmId), uuids)
 }
 
-// reportMTU logs the ATT MTU once the phone has negotiated one. gatt starts
-// a connection at the 23-byte default and raises it when the phone asks, so
-// this waits briefly for the exchange.
+// reportMTU records and logs the ATT MTU once the phone has negotiated one.
+// gatt starts a connection at the 23-byte default and raises it when the
+// phone asks, so this waits briefly for the exchange. A link too small to
+// carry a packet only fails later, when the pod refuses to pair over it,
+// so say so here too: this is the first moment it is knowable.
 func (r *gattRadio) reportMTU(c gatt.Central) {
-	const needed = 247 // an Omnipod 5 packet is 244 bytes, plus the 3-byte header
+	needed := r.profile.Layout.MaxPayloadSize + 3 // the 3-byte ATT write header
 	for i := 0; i < 20; i++ {
 		time.Sleep(100 * time.Millisecond)
-		if mtu := c.MTU(); mtu > 23 {
-			if r.profile.Mode.IsO5() && mtu < needed {
-				log.Warnf("pkg bluetooth; the phone negotiated an ATT MTU of %d, below the %d an Omnipod 5 packet needs; pairing will truncate", mtu, needed)
-			} else {
-				log.Infof("pkg bluetooth; the phone negotiated an ATT MTU of %d", mtu)
-			}
-			return
+		mtu := c.MTU()
+		if mtu <= 23 {
+			continue
 		}
+		r.setLinkMTU(mtu)
+		if mtu < needed {
+			log.Errorf("pkg bluetooth; the phone negotiated an ATT MTU of %d, below the %d an %s packet needs; the pod will refuse to pair over it", mtu, needed, r.profile.Mode.Description())
+		} else {
+			log.Infof("pkg bluetooth; the phone negotiated an ATT MTU of %d", mtu)
+		}
+		return
 	}
+	r.setLinkMTU(c.MTU())
 	log.Warnf("pkg bluetooth; the phone never raised the ATT MTU above the 23-byte default")
+}
+
+func (r *gattRadio) setLinkMTU(mtu int) {
+	r.mtuMtx.Lock()
+	r.linkMTU = mtu
+	r.mtuMtx.Unlock()
+}
+
+// LinkMTU is what the phone negotiated, or 0 before it has.
+func (r *gattRadio) LinkMTU() int {
+	r.mtuMtx.Lock()
+	defer r.mtuMtx.Unlock()
+	return r.linkMTU
 }
 
 // Advertise updates the advertisement; paypal/gatt needs no StopAdvertising first.

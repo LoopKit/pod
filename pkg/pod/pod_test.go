@@ -44,6 +44,7 @@ func (r *radio) NotifyData(p bluetooth.Packet) error {
 
 func (r *radio) Advertise([]byte, uint32) error             { return nil }
 func (r *radio) AdvertiseState(bluetooth.AdvertState) error { return nil }
+func (r *radio) LinkMTU() int                               { return 0 }
 
 func (r *radio) Disconnect() {
 	select {

@@ -20,6 +20,7 @@ func main() {
 	var apiAddr = flag.String("api", ":8080", "address of the control panel and its API")
 	var transport = flag.String("transport", "ble", "ble (a Linux Bluetooth adapter) or impossible (ImpossiBLE's socket, for an app in the iOS Simulator)")
 	var socket = flag.String("socket", "/tmp/impossible.sock", "ImpossiBLE socket for -transport impossible")
+	var hci = flag.Int("hci", -1, "Bluetooth adapter to serve the pod from: 0 for hci0, -1 for the first with LE support. An Omnipod 5 needs a Bluetooth 4.2 or later radio, so name the dongle rather than a Pi 3B's own")
 	var modeName = flag.String("mode", string(bluetooth.ModeDash), "the pod to simulate: dash or o5 (Omnipod 5)")
 
 	flag.Parse()
@@ -71,7 +72,7 @@ func main() {
 	var attach func(*bluetooth.Ble) (bluetooth.Radio, error)
 	switch *transport {
 	case "ble":
-		attach = func(b *bluetooth.Ble) (bluetooth.Radio, error) { return bluetooth.NewGattRadio(b, state.Id) }
+		attach = func(b *bluetooth.Ble) (bluetooth.Radio, error) { return bluetooth.NewGattRadio(b, state.Id, *hci) }
 	case "impossible":
 		attach = func(b *bluetooth.Ble) (bluetooth.Radio, error) {
 			return bluetooth.NewSimRadio(b, *socket, state.PeripheralID, state.Id)

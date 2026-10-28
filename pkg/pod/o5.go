@@ -36,10 +36,19 @@ func (p *Pod) startO5Activation() {
 		{"SP0GP0", o5.ParseSP0GP0, o5.GenerateP0},
 	}
 
-	for _, step := range steps {
+	for i, step := range steps {
 		msg, ok := p.readSetup()
 		if !ok {
 			return
+		}
+		if i == 0 {
+			// The phone has written, so its ATT MTU exchange is behind us.
+			// Refuse a link too small to carry a packet rather than stall on
+			// SPS2.1, the first message that needs more than one.
+			if err := p.ble.MTUShortfall(); err != nil {
+				p.startOver("%s", err)
+				return
+			}
 		}
 		if err := step.parse(msg); err != nil {
 			p.startOver("error parsing %s: %s", step.name, err)
