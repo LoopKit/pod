@@ -17,7 +17,8 @@ import (
 func (p *Pod) startO5Activation() {
 	o5, err := pair.NewO5()
 	if err != nil {
-		log.Fatalf("pkg pod; could not make the pod's pairing keys: %s", err)
+		p.startOver("could not make the pod's pairing keys: %s", err)
+		return
 	}
 
 	// Each step reads the phone's message and answers it. A reply of nil
@@ -41,9 +42,8 @@ func (p *Pod) startO5Activation() {
 			return
 		}
 		if err := step.parse(msg); err != nil {
-			// As on the DASH path, a pairing the pod cannot follow ends
-			// the simulator; restart it and pair again.
-			log.Fatalf("pkg pod; error parsing %s: %s", step.name, err)
+			p.startOver("error parsing %s: %s", step.name, err)
+			return
 		}
 		log.Infof("pkg pod; Received %s", step.name)
 		if step.reply == nil {
@@ -51,14 +51,16 @@ func (p *Pod) startO5Activation() {
 		}
 		reply, err := step.reply()
 		if err != nil {
-			log.Fatalf("pkg pod; could not answer %s: %s", step.name, err)
+			p.startOver("could not answer %s: %s", step.name, err)
+			return
 		}
 		p.ble.WriteMessage(reply)
 	}
 
 	ltk, err := o5.LTK()
 	if err != nil {
-		log.Fatalf("pkg pod; pairing produced no long-term key: %s", err)
+		p.startOver("pairing produced no long-term key: %s", err)
+		return
 	}
 
 	p.mtx.Lock()
@@ -68,7 +70,7 @@ func (p *Pod) startO5Activation() {
 	if pdmId := o5.PdmID(); len(pdmId) == 4 {
 		p.state.PdmId = uint32(pdmId[0])<<24 | uint32(pdmId[1])<<16 | uint32(pdmId[2])<<8 | uint32(pdmId[3])
 	}
-	p.state.EapAkaSeq = 1
+	p.state.EapAkaSeq = 0 // the controller's first session uses SQN 1
 	pdmId := p.state.PdmId
 	if err := p.state.Save(); err != nil {
 		log.Errorf("pkg pod; could not save the pod state: %s", err)

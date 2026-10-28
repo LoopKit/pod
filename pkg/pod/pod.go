@@ -135,6 +135,14 @@ func (p *Pod) product() response.Product {
 	return response.DashProduct()
 }
 
+// startOver hangs up on a phone whose message the pod can't use. The phone
+// reconnects and sets up a new session.
+func (p *Pod) startOver(format string, args ...interface{}) {
+	log.Errorf("pkg pod; "+format+"; hanging up", args...)
+	p.ble.ShutdownConnection()
+	go p.StartAcceptingCommands()
+}
+
 func (p *Pod) StartActivation() {
 	if p.isO5() {
 		p.startO5Activation()
@@ -147,14 +155,16 @@ func (p *Pod) StartActivation() {
 		return
 	}
 	if err := pair.ParseSP1SP2(msg); err != nil {
-		log.Fatalf("pkg pod; error parsing SP1SP2 %s", err)
+		p.startOver("error parsing SP1SP2 %s", err)
+		return
 	}
 	// read PDM public key and nonce
 	if msg, ok = p.readSetup(); !ok {
 		return
 	}
 	if err := pair.ParseSPS1(msg); err != nil {
-		log.Fatalf("pkg pod; error parsing SPS1 %s", err)
+		p.startOver("error parsing SPS1 %s", err)
+		return
 	}
 
 	msg, err := pair.GenerateSPS1()
@@ -168,7 +178,10 @@ func (p *Pod) StartActivation() {
 	if msg, ok = p.readSetup(); !ok {
 		return
 	}
-	pair.ParseSPS2(msg)
+	if err := pair.ParseSPS2(msg); err != nil {
+		p.startOver("error parsing SPS2 %s", err)
+		return
+	}
 
 	// send POD conf value
 	msg, err = pair.GenerateSPS2()
@@ -183,7 +196,8 @@ func (p *Pod) StartActivation() {
 	}
 	err = pair.ParseSP0GP0(msg)
 	if err != nil {
-		log.Fatalf("pkg pod; could not parse SP0GP0: %s", err)
+		p.startOver("could not parse SP0GP0: %s", err)
+		return
 	}
 
 	// send P0 constant
@@ -198,7 +212,7 @@ func (p *Pod) StartActivation() {
 		log.Fatalf("pkg pod; could not get LTK %s", err)
 	}
 	log.Infof("pkg pod; LTK %x", p.state.LTK)
-	p.state.EapAkaSeq = 1
+	p.state.EapAkaSeq = 0 // the controller's first session uses SQN 1
 	p.state.Save()
 
 	p.EapAka()
@@ -206,18 +220,36 @@ func (p *Pod) StartActivation() {
 
 func (p *Pod) EapAka() {
 
-	session := eap.NewEapAkaChallenge(p.state.LTK, p.state.EapAkaSeq)
-
-	msg, ok := p.readSetup()
-	if !ok {
-		return
+	var session *eap.EapAkaChallenge
+	var msg *message.Message
+	var ok bool
+	for {
+		session = eap.NewEapAkaChallenge(p.state.LTK, p.state.EapAkaSeq)
+		if msg, ok = p.readSetup(); !ok {
+			return
+		}
+		if err := session.ParseChallenge(msg); err != nil {
+			p.startOver("error parsing the EAP-AKA challenge: %s", err)
+			return
+		}
+		fresh, err := session.CheckSqn()
+		if err != nil {
+			p.startOver("error checking the EAP-AKA challenge: %s", err)
+			return
+		}
+		if fresh {
+			break
+		}
+		// Another controller has had a session since this one's last: tell it our SQN.
+		// It retries on the same connection with the next one.
+		log.Infof("pkg pod; EAP-AKA SQN %d is not past %d; sending a synchronization failure", session.Sqn, p.state.EapAkaSeq)
+		if msg, err = session.GenerateSynchronizationFailure(); err != nil {
+			log.Fatalf("pkg pod; error generating the eap-aka synchronization failure: %s", err)
+		}
+		p.ble.WriteMessage(msg)
 	}
-	err := session.ParseChallenge(msg)
-	if err != nil {
-		log.Fatalf("pkg pod; error parsing the EAP-AKA challenge: %s", err)
-	}
 
-	msg, err = session.GenerateChallengeResponse()
+	msg, err := session.GenerateChallengeResponse()
 	if err != nil {
 		log.Fatalf("pkg pod; error generating the eap-aka challenge response")
 	}
@@ -229,7 +261,8 @@ func (p *Pod) EapAka() {
 	log.Debugf("pkg pod; success? %x", msg.Payload) // TODO: figure out how error looks like
 	err = session.ParseSuccess(msg)
 	if err != nil {
-		log.Fatalf("pkg pod; error parsing the EAP-AKA Success packet: %s", err)
+		p.startOver("error parsing the EAP-AKA Success packet: %s", err)
+		return
 	}
 	p.state.CK, p.state.NoncePrefix = session.CKNoncePrefix()
 
@@ -319,67 +352,67 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 
 		decrypted, err := encrypt.DecryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, msg)
 		if err != nil {
-			log.Fatalf("pkg pod; could not decrypt message: %s", err)
+			p.mtx.Unlock()
+			p.startOver("could not decrypt message: %s", err)
+			return
 		}
 		p.state.NonceSeq++
 
 		// An Omnipod 5 is sent its setup commands on this same transport
-		// before it is set up. They are not command blocks, and the phone
-		// does not acknowledge the answer.
+		// before it is set up. They are not command blocks, and their
+		// payloads are short ASCII — "G3.12" is five bytes — so this has to
+		// come before the command-length guard below.
 		if p.isO5() && aid.Looks(decrypted.Payload) {
-			ok := p.handleAidCommand(decrypted.Payload, msg.Source, msg.Destination, msg.SequenceNumber)
-			if ok {
-				// The phone acknowledges an AID answer as it does any
-				// other response (sendO5AidCommand), and that
-				// acknowledgement carries a nonce of its own.
-				ack, reconnected := p.readResponseAck()
-				if ack == nil {
-					p.state.Save()
-					p.takeSnapshot()
-					p.mtx.Unlock()
-					log.Infof("pkg pod; no AID answer ACK — re-establishing session")
-					if !reconnected {
-						p.ble.ShutdownConnection()
-					}
-					go p.StartAcceptingCommands()
-					return
-				}
-				if err := p.consumeAck(ack); err != nil {
-					log.Errorf("pkg pod; %s", err)
-					ok = false
-				}
+			if !p.handleAidCommand(decrypted.Payload, msg.Source, msg.Destination, msg.SequenceNumber) {
+				p.state.Save()
+				p.takeSnapshot()
+				p.mtx.Unlock()
+				p.startOver("could not answer the AID command")
+				return
 			}
+			// The phone acknowledges an AID answer as it does any other
+			// response (sendO5AidCommand), and that acknowledgement carries
+			// a nonce of its own.
+			ack, reconnected := p.readResponseAck()
+			if ack == nil {
+				p.state.Save()
+				p.takeSnapshot()
+				p.mtx.Unlock()
+				log.Infof("pkg pod; no AID answer ACK — re-establishing session")
+				if !reconnected {
+					p.ble.ShutdownConnection()
+				}
+				go p.StartAcceptingCommands()
+				return
+			}
+			err := p.consumeAck(ack)
 			p.state.Save()
 			p.takeSnapshot()
 			p.mtx.Unlock()
-			if !ok {
-				log.Errorf("pkg pod; could not complete the AID command — re-establishing session")
-				p.ble.ShutdownConnection()
-				go p.StartAcceptingCommands()
+			if err != nil {
+				p.startOver("could not read the AID answer ACK: %s", err)
 				return
 			}
 			p.notifyStateChange()
 			continue
 		}
 
+		if len(decrypted.Payload) < 16 {
+			p.mtx.Unlock()
+			p.startOver("decrypted payload too short: %x", decrypted.Payload)
+			return
+		}
 		cmd, err := command.Unmarshal(decrypted.Payload)
 		if err != nil {
-			// Exiting here would take the pod's radio with it, and the
-			// app would report its Bluetooth gone rather than the message
-			// the pod could not read. Hang up instead: the phone comes
-			// back and sets up a new session.
-			log.Errorf("pkg pod; could not read the command %x: %s", decrypted.Payload, err)
-			p.state.Save()
-			p.takeSnapshot()
 			p.mtx.Unlock()
-			log.Infof("pkg pod; re-establishing the session")
-			p.ble.ShutdownConnection()
-			go p.StartAcceptingCommands()
+			p.startOver("could not unmarshal command: %s", err)
 			return
 		}
 		cmdSeq, requestID, err := cmd.GetHeaderData()
 		if err != nil {
-			log.Fatalf("pkg pod; could not get command header data: %s", err)
+			p.mtx.Unlock()
+			p.startOver("could not get command header data: %s", err)
+			return
 		}
 		p.state.CmdSeq = cmdSeq
 
@@ -387,9 +420,6 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		data = decrypted.Payload
 		n = len(data)
 		log.Debugf("pkg pod; len = %d", n)
-		if n < 19 {
-			log.Fatalf("pkg pod; decrypted payload of %d bytes is too short to hold a command", n)
-		}
 		pMsg.MsgBodyCommand = data[13 : n-5]
 		if data[13] == 0x1c {
 			pMsg.DeactivateFlag = true
@@ -481,12 +511,14 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 			return
 		}
 		// TODO check for SEQ numbers here and the Ack flag
-		if err := p.consumeAck(msg); err != nil {
-			log.Fatalf("pkg pod; %s", err)
-		}
+		err = p.consumeAck(msg)
 		p.state.Save()
 		p.takeSnapshot()
 		p.mtx.Unlock()
+		if err != nil {
+			p.startOver("could not read the response ACK: %s", err)
+			return
+		}
 
 		log.Debugf("notifyingStateChange")
 		p.notifyStateChange()
