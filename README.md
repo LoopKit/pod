@@ -19,7 +19,7 @@ Fake pod implementation
 Requirements:
 1. Version of iOS code (Loop app) that will interact with this simulator - Loop dev branch or FreeAPS freeaps_dev branch
 2. Raspberry pi with Bluetooth BLE (using a pi3b or pi4 right now). For `-mode o5` the
-   radio must be Bluetooth 4.2 or later, which a pi3b's is not; see
+   radio must report Bluetooth 4.2 or later, which not every pi does; see
    [An Omnipod 5 over real Bluetooth needs a 4.2+ radio](#an-omnipod-5-over-real-bluetooth-needs-a-42-radio)
 3. The user must have sudo privilege on the pi
 4. Install the go language on your device (search internet for procedure)
@@ -155,20 +155,61 @@ every write is silently truncated. Pairing then fails at SPS2.1, the first messa
 needs more than one packet. The pod refuses such a link rather than stall on it, and says
 so in the log.
 
-This rules out a Pi 3B's or Zero W's own radio, and the Pi 3B+, 4 and 5 are fine:
-
-| Board | Bluetooth | Omnipod 5 over real Bluetooth |
-| --- | --- | --- |
-| Pi 3B, Zero W | 4.1 | no — needs a dongle |
-| Pi 3B+ | 4.2 | yes |
-| Pi 4, Pi 5 | 5.0 | yes |
-
-Check what you have, and what a phone settled on:
+What matters is the version the controller *reports*, not the board it is on. Measure it;
+do not infer it from the model. A Pi 3B's own radio reports 4.1 and will not do, a Pi 3B+,
+4 or 5 is usually 4.2 or 5.0, but a Pi 4 has been seen reporting 4.1 — the Pi's Bluetooth
+firmware decides, so two of the same board can differ.
 
 ```
-hciconfig hci0 version                 # "HCI Version: 4.1" is too old
+cat /proc/device-tree/model            # which board this is
+hciconfig hci0 version                 # "HCI Version: 4.1" is too old; 4.2 or later is wanted
 sudo hcitool -i hci0 lefeatures        # look for LE Data Packet Length Extension
 ```
+
+If the board is supposed to be newer than the version it reports, find out which radio it
+actually has before buying anything. Two boards both called a Pi 4 were seen reporting
+differently, one pairing an Omnipod 5 and one failing at SPS2.1:
+
+```
+HCI Version: 5.0 (0x9)  Revision: 0x17e   Manufacturer: Cypress Semiconductor (305)   # paired
+HCI Version: 4.1 (0x7)  Revision: 0x0     Manufacturer: Broadcom Corporation (15)     # did not
+```
+
+That gap has two possible causes and they need opposite remedies, so identify it rather
+than guess. `dmesg` settles it, because it names the part and says whether the kernel's
+firmware patch loaded:
+
+```
+cat /proc/device-tree/model; grep Revision /proc/cpuinfo
+sudo dmesg | grep -iE "bcm|bluetooth|firmware"
+```
+
+* **`BCM43430A1`/`BCM43438`** is a Broadcom 4.1 radio — a Pi 3B or Zero W class part, whatever
+  the board is called. It cannot serve an Omnipod 5, so use a dongle or another board.
+* **`BCM4345C0`** is the Cypress part in a 3B+, 4, 5 or CM4, and should report 4.2 or later.
+  If it reports less, or `dmesg` shows the patch failing to load, that is firmware: it comes
+  from the `bluez-firmware` package, and an older one carries an `.hcd` predating 4.2
+  support.
+
+```
+ls -l /lib/firmware/brcm/BCM4345C0*.hcd
+dpkg -s bluez-firmware | grep -i Version
+sudo apt update && sudo apt full-upgrade && sudo reboot
+hciconfig hci0 version
+```
+
+The kernel asks for a device-tree-specific name first, such as
+`brcm/BCM4345C0.raspberrypi,4-model-b.hcd`, and only then the plain `brcm/BCM4345C0.hcd`.
+If `dmesg` reports the specific name missing while the plain file is there, give it the
+name it asked for:
+
+```
+sudo cp /lib/firmware/brcm/BCM4345C0.hcd \
+    "/lib/firmware/brcm/BCM4345C0.raspberrypi,4-model-b.hcd"   # the name from dmesg
+```
+
+`hciuart.service` is what attaches the adapter on a Pi, so check it is not disabled — the
+instructions further down stop `bluetooth`, which is the daemon, not this.
 
 The simulator logs the MTU as soon as the phone has negotiated one:
 
@@ -177,7 +218,7 @@ INFO  pkg bluetooth; the phone negotiated an ATT MTU of 256
 ERROR pkg bluetooth; the phone negotiated an ATT MTU of 185, below the 247 an Omnipod 5 ...
 ```
 
-On an older radio, a **Bluetooth 4.2+ USB dongle** is the fix. It will not be `hci0`, and
+On a radio that still reports older than 4.2, a **Bluetooth 4.2+ USB dongle** is the fix. It will not be `hci0`, and
 the simulator takes the first adapter with LE support unless told otherwise, so name it:
 
 ```
