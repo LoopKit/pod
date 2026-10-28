@@ -186,27 +186,23 @@ sudo dmesg | grep -iE "bcm|bluetooth|firmware"
 
 * **`BCM43430A1`/`BCM43438`** is a Broadcom 4.1 radio — a Pi 3B or Zero W class part, whatever
   the board is called. It cannot serve an Omnipod 5, so use a dongle or another board.
-* **`BCM4345C0`** is the Cypress part in a 3B+, 4, 5 or CM4, and should report 4.2 or later.
-  If it reports less, or `dmesg` shows the patch failing to load, that is firmware: it comes
-  from the `bluez-firmware` package, and an older one carries an `.hcd` predating 4.2
-  support.
+* **`BCM4345C0`** is the Cypress part in a 3B+, 4, 5 or CM4, and reports 4.2 or later once
+  its firmware patch has loaded. `dmesg` saying `BCM: firmware Patch file not found` — or
+  `build 0000` in the line above it — means the radio is running ROM, which still works but
+  reports 4.1. The file is not on every distribution: Raspberry Pi OS ships it in
+  `bluez-firmware`, while Ubuntu's Pi images do not carry it at all. Fetch it and reboot:
 
 ```
-ls -l /lib/firmware/brcm/BCM4345C0*.hcd
-dpkg -s bluez-firmware | grep -i Version
-sudo apt update && sudo apt full-upgrade && sudo reboot
-hciconfig hci0 version
+sudo mkdir -p /lib/firmware/brcm
+sudo curl -fsSL -o /lib/firmware/brcm/BCM4345C0.hcd \
+    https://github.com/RPi-Distro/bluez-firmware/raw/master/broadcom/BCM4345C0.hcd
+sudo reboot
+hciconfig hci0 version      # Cypress Semiconductor (305), 4.2 or later, revision not 0x0
 ```
 
-The kernel asks for a device-tree-specific name first, such as
-`brcm/BCM4345C0.raspberrypi,4-model-b.hcd`, and only then the plain `brcm/BCM4345C0.hcd`.
-If `dmesg` reports the specific name missing while the plain file is there, give it the
-name it asked for:
-
-```
-sudo cp /lib/firmware/brcm/BCM4345C0.hcd \
-    "/lib/firmware/brcm/BCM4345C0.raspberrypi,4-model-b.hcd"   # the name from dmesg
-```
+The kernel tries a device-tree-specific name such as
+`brcm/BCM4345C0.raspberrypi,4-model-b.hcd` before the plain one, so the plain file is
+enough; `dmesg` lists every name it tried.
 
 `hciuart.service` is what attaches the adapter on a Pi, so check it is not disabled — the
 instructions further down stop `bluetooth`, which is the daemon, not this.
