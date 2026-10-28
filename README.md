@@ -162,6 +162,27 @@ Xcode picks the file up on its own. Keep it out of git: it pairs with this simul
 with nothing else, because neither side validates the other's certificate chain — each
 only reads the public key out of the certificate to check the other's signature.
 
+### Telling a simulated pod from a real one
+
+Every pod this simulator serves shows the same certificate authority in SPS2.1
+and its own certificate, signed by that authority, in SPS2 — the shape a real
+pod uses, where SPS2.1 carries Insulet's intermediate and SPS2 the pod's own.
+
+The authority is fixed and its private key is in this repository on purpose. It
+is a development marker, not a secret: an app that pins it can report a pod as
+simulated rather than merely failing to recognise it, the way g7sim's published
+CA lets Loop mark a simulated G7. It proves nothing about authenticity and must
+never be treated as if it did.
+
+```
+go run ./cmd/o5keypair -ca      # the CA, as hex to embed in an app
+```
+
+A real pod chains to `INS01PG1`, issued by `INS00PG1`, and its own certificate
+may well be expired — one was found nineteen months past its notAfter and
+pairing normally, because nothing checks. An authenticity check should verify
+the chain and ignore validity dates.
+
 ### Pair it with Loop
 
 Loop must come from LoopWorkspace `next-dev`, which pins the OmnipodKit that talks to a

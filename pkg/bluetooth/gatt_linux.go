@@ -141,7 +141,7 @@ func (r *gattRadio) advertise() error {
 		}
 		uuids = append(uuids, u)
 	}
-	return r.device.AdvertiseNameAndServices(AdvertisedName, uuids)
+	return r.device.AdvertiseNameAndServices(r.profile.AdvertisedName(pdmId), uuids)
 }
 
 // reportMTU logs the ATT MTU once the phone has negotiated one. gatt starts

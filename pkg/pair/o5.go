@@ -70,9 +70,13 @@ type O5 struct {
 	ltk    []byte
 	nonces *spsNonces
 
-	// identity is the key the pod's certificate carries and signs with.
+	// identity is the key the pod's leaf certificate carries and signs with.
 	identity *ecdsa.PrivateKey
-	certDER  []byte
+	// leafDER is the pod's own certificate, signed by the simulator's CA;
+	// caDER is that CA, which the pod shows in SPS2.1 so an app can follow
+	// the chain and tell a simulated pod from a real one.
+	leafDER []byte
+	caDER   []byte
 
 	// controllerPublic is the phone's signing key, read out of the
 	// certificate it shows in SPS2. Signed commands are checked against it.
@@ -90,7 +94,11 @@ func NewO5() (*O5, error) {
 	if err != nil {
 		return nil, fmt.Errorf("could not make the pod's signing key: %w", err)
 	}
-	certDER, err := selfSignedCert(identity, "pod simulator pod")
+	if err := checkSimulatorCA(); err != nil {
+		return nil, err
+	}
+	caKey, caCert, caDER := simulatorCA()
+	leafDER, err := podCertificate(identity, caCert, caKey)
 	if err != nil {
 		return nil, err
 	}
@@ -103,7 +111,8 @@ func NewO5() (*O5, error) {
 		podPublic:   ecdhKey.PublicKey().Bytes()[1:], // drop the 04 prefix
 		podNonce:    nonce,
 		identity:    identity,
-		certDER:     certDER,
+		leafDER:     leafDER,
+		caDER:       caDER,
 	}, nil
 }
 
@@ -209,9 +218,10 @@ func (c *O5) ParseSPS21(msg *message.Message) error {
 	return nil
 }
 
-// GenerateSPS21 shows the pod's certificate.
+// GenerateSPS21 shows the authority the pod's certificate chains to, as the
+// controller shows its intermediate here.
 func (c *O5) GenerateSPS21() (*message.Message, error) {
-	sealed, err := c.nonces.seal(c.conf, spsPodToPhone, c.certDER)
+	sealed, err := c.nonces.seal(c.conf, spsPodToPhone, c.caDER)
 	if err != nil {
 		return nil, fmt.Errorf("could not encrypt SPS2.1: %w", err)
 	}
@@ -262,7 +272,7 @@ func (c *O5) GenerateSPS2() (*message.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	plain := append(append([]byte(nil), c.certDER...), signature...)
+	plain := append(append([]byte(nil), c.leafDER...), signature...)
 	sealed, err := c.nonces.seal(c.conf, spsPodToPhone, plain)
 	if err != nil {
 		return nil, fmt.Errorf("could not encrypt SPS2: %w", err)
@@ -511,10 +521,32 @@ func publicKeyFromCert(der []byte) ([]byte, error) {
 	return out, nil
 }
 
-// selfSignedCert makes the certificate a side shows during pairing. The
+// podCertificate makes this pod's leaf, signed by the simulator's CA, so an
+// app can follow the chain and tell a simulated pod from a real one. The
 // phone finds the public key by looking for the standard P-256
 // SubjectPublicKeyInfo bytes, which this layout gives it
 // (O5CertificateStore.extractP256PublicKey).
+func podCertificate(key *ecdsa.PrivateKey, caCert *x509.Certificate, caKey *ecdsa.PrivateKey) ([]byte, error) {
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 64))
+	if err != nil {
+		return nil, err
+	}
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject: pkix.Name{
+			Organization: []string{"pod simulator"},
+			CommonName:   "pod simulator pod",
+		},
+		NotBefore: time.Now().Add(-time.Hour),
+		NotAfter:  time.Now().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:  x509.KeyUsageDigitalSignature,
+	}
+	return x509.CreateCertificate(rand.Reader, template, caCert, &key.PublicKey, caKey)
+}
+
+// selfSignedCert makes a standalone certificate. The controller-side key
+// generator uses it; a pod's own certificate is signed by the simulator's CA
+// instead, so that it chains.
 func selfSignedCert(key *ecdsa.PrivateKey, commonName string) ([]byte, error) {
 	template := &x509.Certificate{
 		SerialNumber: big.NewInt(1),
@@ -522,11 +554,10 @@ func selfSignedCert(key *ecdsa.PrivateKey, commonName string) ([]byte, error) {
 			Organization: []string{"pod simulator"},
 			CommonName:   commonName,
 		},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(10 * 365 * 24 * time.Hour),
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
-		IsCA:                  true,
-		BasicConstraintsValid: false,
+		NotBefore: time.Now().Add(-time.Hour),
+		NotAfter:  time.Now().Add(10 * 365 * 24 * time.Hour),
+		KeyUsage:  x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		IsCA:      true,
 	}
 	return x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 }

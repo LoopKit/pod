@@ -126,3 +126,36 @@ func reverseBytes(b []byte) []byte {
 	}
 	return out
 }
+
+// A real Omnipod 5 names itself "AP <controller id> <lot><tid>", captured from
+// a pod as "AP FFFFFFFE 0E977731000A3AB7" while it was still unpaired. The
+// simulator mirrors that shape so a pod looks like one in a scan.
+func TestO5AdvertisedName(t *testing.T) {
+	o5 := ProfileFor(ModeO5)
+
+	unpaired := o5.AdvertisedName(0)
+	if unpaired != "AP FFFFFFFE 0E146DB10006E451" {
+		t.Errorf("an unpaired pod is named %q", unpaired)
+	}
+	paired := o5.AdvertisedName(0x002A1C6C)
+	if paired != "AP 002A1C6C 0E146DB10006E451" {
+		t.Errorf("a paired pod is named %q", paired)
+	}
+
+	// The name goes in the scan response, which is also 31 bytes: two of
+	// header plus the name itself.
+	if n := 2 + len(paired); n > 31 {
+		t.Errorf("the name needs %d bytes of the scan response, over 31", n)
+	}
+
+	// The lot in the name has to decode as an Omnipod 5, as the real pod's
+	// 0E977731 does: bits 25-30 are the product, 7 for a U100 Omnipod 5.
+	if got := (0x0E146DB1 >> 25) & 0x3f; got != 7 {
+		t.Errorf("the advertised lot decodes as product %d, want 7", got)
+	}
+
+	// A DASH keeps the name this simulator has always used.
+	if got := ProfileFor(ModeDash).AdvertisedName(0); got != AdvertisedName {
+		t.Errorf("a DASH is named %q, want %q", got, AdvertisedName)
+	}
+}

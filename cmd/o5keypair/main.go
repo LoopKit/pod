@@ -28,6 +28,8 @@ import (
 	"os"
 	"text/template"
 	"time"
+
+	"github.com/avereha/pod/pkg/pair"
 )
 
 func main() {
@@ -35,7 +37,13 @@ func main() {
 	// two bits, the way an Omnipod 5 controller forms its own.
 	id := flag.Uint64("id", 0x002A1C6C, "the controller id to issue the data for")
 	asSwift := flag.Bool("swift", false, "write a Swift file to build into OmnipodKit instead of JSON")
+	showCA := flag.Bool("ca", false, "print the simulator's pod CA, which an app pins to recognise a simulated pod")
 	flag.Parse()
+
+	if *showCA {
+		printCA()
+		return
+	}
 
 	if *id == 0 || *id > 0xFFFFFFFF {
 		fail(fmt.Errorf("the controller id must be between 1 and 0xFFFFFFFF, not 0x%X", *id))
@@ -58,6 +66,26 @@ func main() {
 		fail(err)
 	}
 	fmt.Println(string(out))
+}
+
+// printCA writes the certificate authority every simulated pod chains to, in
+// the form an app embeds to tell a simulated pod from a real one. It proves
+// nothing about authenticity: the key is in this repository on purpose.
+func printCA() {
+	der := pair.SimulatorCACertificate()
+	cert, err := x509.ParseCertificate(der)
+	if err != nil {
+		fail(err)
+	}
+	fmt.Fprintf(os.Stderr, "pod simulator CA: %s, %d bytes\n", cert.Subject.CommonName, len(der))
+	h := hex.EncodeToString(der)
+	for i := 0; i < len(h); i += 64 {
+		end := i + 64
+		if end > len(h) {
+			end = len(h)
+		}
+		fmt.Printf("\"%s\",\n", h[i:end])
+	}
 }
 
 func fail(err error) {

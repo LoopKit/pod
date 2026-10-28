@@ -28,12 +28,19 @@ const (
 	LotOmnipod5 uint32 = 0x0E146DB1 // decodes as H1
 )
 
+// Tid is the pod's sequence number within its lot, the second half of the
+// identity an Omnipod 5 advertises in its name.
+const Tid uint32 = 0x0006E451
+
 // Product is which pod the version responses report. The zero value is a
 // DASH, which is what the simulator was before it could be anything else.
 type Product struct {
 	ID  byte
 	Lot uint32
 }
+
+// Tid is the sequence number that goes with this product's lot.
+func (p Product) Tid() uint32 { return Tid }
 
 // DashProduct and Omnipod5Product are the two the simulator serves.
 func DashProduct() Product     { return Product{ID: ProductIDDash, Lot: LotDash} }
