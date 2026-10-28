@@ -6,7 +6,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"hash/crc32"
 	"sync"
 	"time"
 
@@ -24,6 +23,10 @@ var (
 	CmdAbort   = Packet([]byte{3})
 	CmdSuccess = Packet([]byte{4})
 	CmdFail    = Packet([]byte{5})
+	CmdHello   = Packet([]byte{6})
+	// An Omnipod 5 reports progress with this while it works through a
+	// pairing message (OmnipodKit's PodCommand.PAIR_STATUS).
+	CmdPairStatus = Packet([]byte{8})
 )
 
 // Radio carries the pod's command and data characteristics to the phone:
@@ -31,9 +34,12 @@ var (
 type Radio interface {
 	NotifyCmd(Packet) error
 	NotifyData(Packet) error
-	Advertise(podId []byte) error
+	Advertise(podId []byte, pdmId uint32) error
 	AdvertiseState(state AdvertState) error
 	Disconnect()
+	// LinkMTU is the ATT MTU the phone negotiated, or 0 when the
+	// transport has none to report.
+	LinkMTU() int
 }
 
 const AdvertisedName = " :: Fake POD ::"
@@ -120,6 +126,10 @@ type Ble struct {
 	reconnected chan bool
 	radio       Radio
 
+	profile     Profile
+	pdmId       uint32 // the controller the pod is paired to; guarded by genMtx
+	podIdLocked []byte // the pod id last advertised; guarded by genMtx
+
 	// connGen counts central connections; servingGen is the one the
 	// message loop was started for. They differ only after a real reconnect.
 	genMtx     sync.Mutex
@@ -129,8 +139,9 @@ type Ble struct {
 }
 
 // New starts the pod's link layer on the radio that attach returns.
-func New(attach func(*Ble) (Radio, error)) (*Ble, error) {
+func New(attach func(*Ble) (Radio, error), profile Profile) (*Ble, error) {
 	b := &Ble{
+		profile:       profile,
 		in:            newInput(),
 		dataOutput:    make(chan Packet, 5),
 		cmdOutput:     make(chan Packet, 5),
@@ -222,8 +233,29 @@ func read(ch chan Packet, stop chan bool) (Packet, error) {
 
 func (b *Ble) RefreshAdvertisingWithSpecifiedId(id []byte) error { // 4 bytes, first 2 usually empty
 	log.Debugf("RefreshAdvertisingWithSpecifiedId %x", id)
-	return b.radio.Advertise(id)
+	b.genMtx.Lock()
+	b.podIdLocked = id
+	pdmId := b.pdmId
+	b.genMtx.Unlock()
+	return b.radio.Advertise(id, pdmId)
 }
+
+// SetPdmId records the controller the pod is paired to. An Omnipod 5
+// advertises it, so the phone can pick its own pod out while disconnected
+// (BluetoothManager.podScanServiceUUID).
+func (b *Ble) SetPdmId(pdmId uint32) {
+	b.genMtx.Lock()
+	changed := b.pdmId != pdmId
+	b.pdmId = pdmId
+	podId := b.podIdLocked
+	b.genMtx.Unlock()
+	if changed {
+		b.radio.Advertise(podId, pdmId)
+	}
+}
+
+// Profile is the BLE profile the pod is serving.
+func (b *Ble) Profile() Profile { return b.profile }
 
 // SetAdvertisedState advertises the pod's fault and firing alerts.
 func (b *Ble) SetAdvertisedState(state AdvertState) error {
@@ -309,11 +341,43 @@ func (b *Ble) ShutdownConnection() {
 	b.radio.Disconnect()
 }
 
+// MTUShortfall reports a link too small to carry a packet of this profile.
+// The phone fragments a message into packets but does not fragment a packet,
+// so a short link truncates every write silently, and pairing stalls on the
+// first message that needs more than one packet. Returns nil when the link
+// is big enough, and when the radio has no MTU to report.
+func (b *Ble) MTUShortfall() error {
+	mtu := b.radio.LinkMTU()
+	if mtu == 0 {
+		return nil
+	}
+	needed := b.profile.Layout.MaxPayloadSize + 3 // the 3-byte ATT write header
+	if mtu >= needed {
+		return nil
+	}
+	return fmt.Errorf("the phone negotiated an ATT MTU of %d, below the %d an %s packet needs, "+
+		"so its writes would be truncated. A phone asks for more only of a Bluetooth 4.2 or "+
+		"later radio: check this one with `hciconfig hci0 version`, and if it is older, plug "+
+		"in a 4.2+ dongle and name it with -hci (it will not be hci0). On a 4.2+ radio, "+
+		"`sudo hcitool -i hci0 cmd 0x08 0x0024 fb 00 48 03` is worth a try. Or run the app in "+
+		"the iOS Simulator over -transport impossible, which has no MTU",
+		mtu, needed, b.profile.Mode.Description())
+}
+
 func (b *Ble) WriteMessage(message *message.Message) {
 	b.messageOutput <- message
 }
 
 func (b *Ble) loop(stop chan bool, in *input) {
+	// A DASH pod is asked for every exchange with RTS on the command
+	// characteristic; an Omnipod 5 has no such handshake, so an inbound
+	// message simply begins with its first data packet. Leaving the data
+	// channel nil for a DASH keeps this select out of the way of the
+	// packet reads inside readMessage.
+	var dataStart chan Packet
+	if !b.profile.UsesRTS() {
+		dataStart = in.data
+	}
 	for {
 		select {
 		case <-stop:
@@ -331,12 +395,32 @@ func (b *Ble) loop(stop chan bool, in *input) {
 				log.Errorf("pkg bluetooth; error writing message: %s", err)
 			}
 		case cmd := <-in.cmd:
+			if !b.profile.UsesRTS() {
+				// The phone only acknowledges here; nothing it writes to
+				// the command characteristic starts a message.
+				log.Tracef("pkg bluetooth; command from the phone: %x", cmd)
+				continue
+			}
 			msg, err := b.readMessage(cmd, in, stop)
 			if err == errStopped {
 				return
 			}
 			if err != nil {
 				// The phone was told it failed and sends it again.
+				log.Errorf("pkg bluetooth; error reading message: %s", err)
+				continue
+			}
+			select {
+			case b.messageInput <- msg:
+			case <-stop:
+				return
+			}
+		case first := <-dataStart:
+			msg, err := b.readMessagePackets(first, in, stop)
+			if err == errStopped {
+				return
+			}
+			if err != nil {
 				log.Errorf("pkg bluetooth; error reading message: %s", err)
 				continue
 			}
@@ -373,180 +457,99 @@ func (b *Ble) StopMessageLoop() {
 }
 
 func (b *Ble) expectCommand(expected Packet, in *input, stop chan bool) error {
-	cmd, err := read(in.cmd, stop)
-	if err != nil {
-		return err
-	}
-	if len(cmd) == 0 || cmd[0] != expected[0] {
-		return fmt.Errorf("expected command: %x. received command: %x", expected, cmd)
-	}
-	return nil
-}
-
-func (b *Ble) writeMessage(msg *message.Message, in *input, stop chan bool) error {
-	var buf bytes.Buffer
-	var index = 0
-
-	b.WriteCmd(CmdRTS)
-	if err := b.expectCommand(CmdCTS, in, stop); err != nil { // TODO figure out what to do if !CTS
-		return err
-	}
-	bytes, err := msg.Marshal()
-	if err != nil {
-		log.Fatalf("pkg bluetooth; could not marshal the message %s", err)
-	}
-	log.Tracef("pkg bluetooth; Sending message: %x", bytes)
-	sum := crc32.ChecksumIEEE(bytes)
-	if len(bytes) <= 18 {
-		buf.WriteByte(byte(index))
-		buf.WriteByte(0)     // fragments
-
-		buf.WriteByte(byte(sum >> 24))
-		buf.WriteByte(byte(sum >> 16))
-		buf.WriteByte(byte(sum >> 8))
-		buf.WriteByte(byte(sum))
-		buf.WriteByte((byte(len(bytes))))
-		end := len(bytes)
-		if len(bytes) > 14 {
-			end = 14
+	for {
+		cmd, err := read(in.cmd, stop)
+		if err != nil {
+			return err
 		}
-		buf.Write(bytes[:end])
-		b.writeDataBuffer(&buf)
-
-		if len(bytes) > 14 {
-			buf.WriteByte(byte(index))
-			buf.WriteByte(byte(len(bytes) - 14))
-			buf.Write(bytes[14:])
-			b.writeDataBuffer(&buf)
+		if len(cmd) == 0 {
+			return fmt.Errorf("expected command: %x. received an empty command", expected)
+		}
+		// A real Omnipod 5 reports progress with 0x08 while it works
+		// through a pairing message; OmnipodKit skips those and keeps
+		// waiting for what it asked for, so the pod tolerates them too.
+		if cmd[0] == CmdPairStatus[0] {
+			log.Tracef("pkg bluetooth; skipping pair status %x", cmd)
+			continue
+		}
+		if cmd[0] != expected[0] {
+			return fmt.Errorf("expected command: %x. received command: %x", expected, cmd)
 		}
 		return nil
 	}
+}
 
-	size := len(bytes)
-	fullFragments := (size - 18) / 19
-	rest := (size - (fullFragments * 19)) - 18
-	buf.WriteByte(byte(index))
-	buf.WriteByte(byte(fullFragments + 1))
-	buf.Write(bytes[:18])
+// writeMessage sends one pod message as a run of packets. A DASH asks to
+// send first and an Omnipod 5 does not, but both wait to be told the
+// message arrived (OmnipodKit's PeripheralManager.sendMessagePacket).
+func (b *Ble) writeMessage(msg *message.Message, in *input, stop chan bool) error {
+	raw, err := msg.Marshal()
+	if err != nil {
+		log.Fatalf("pkg bluetooth; could not marshal the message %s", err)
+	}
+	log.Tracef("pkg bluetooth; Sending message: %x", raw)
 
-	b.writeDataBuffer(&buf)
-
-	for index = 1; index <= fullFragments; index++ {
-		buf.WriteByte(byte(index))
-		if index == 1 {
-			buf.Write(bytes[18:37])
-		} else {
-			buf.Write(bytes[(index-1)*19+18 : (index-1)*19+18+19])
+	if b.profile.UsesRTS() {
+		b.WriteCmd(CmdRTS)
+		if err := b.expectCommand(CmdCTS, in, stop); err != nil { // TODO figure out what to do if !CTS
+			return err
 		}
-		b.writeDataBuffer(&buf)
 	}
 
-	buf.WriteByte(byte(index))
-	buf.WriteByte(byte(rest))
-	buf.WriteByte(byte(sum >> 24))
-	buf.WriteByte(byte(sum >> 16))
-	buf.WriteByte(byte(sum >> 8))
-	buf.WriteByte(byte(sum))
-	end := rest
-	if rest > 14 {
-		end = 14
-	}
-	buf.Write(bytes[(fullFragments*19)+18 : (fullFragments*19)+18+end])
-	b.writeDataBuffer(&buf)
-	if rest > 14 {
-		index++
-		buf.WriteByte(byte(index))
-		buf.WriteByte(byte(rest - 14))
-		buf.Write(bytes[fullFragments*19+18+14:])
-		for buf.Len() < 20 {
-			buf.WriteByte(0)
+	for _, packet := range b.profile.Layout.Split(raw) {
+		if err := b.WriteData(packet); err != nil {
+			return err
 		}
-		b.writeDataBuffer(&buf)
 	}
 	return b.expectCommand(CmdSuccess, in, stop)
 }
 
+// readMessage reads a DASH message, which the phone opens with RTS.
 func (b *Ble) readMessage(cmd Packet, in *input, stop chan bool) (*message.Message, error) {
-	var buf bytes.Buffer
-	var checksum []byte
-
 	log.Trace("pkg bluetooth; Reading RTS")
 	if len(cmd) == 0 || cmd[0] != CmdRTS[0] {
 		return nil, fmt.Errorf("expected command: %x. received command: %x", CmdRTS, cmd)
 	}
 	log.Trace("pkg bluetooth; Sending CTS")
-
 	b.WriteCmd(CmdCTS)
 
 	first, err := read(in.data, stop)
 	if err != nil {
 		return nil, err
 	}
-	fragments := int(first[1])
-	expectedIndex := 1
-	oneExtra := false
-	if fragments == 0 {
-		checksum = first[2:6]
-		len := first[6]
-		end := len + 7
-		if len > 13 {
-			oneExtra = true
-			end = 20
-		}
-		buf.Write(first[7:end])
-	} else {
-		buf.Write(first[2:20])
-	}
-	for i := 1; i < fragments; i++ {
-		data, err := read(in.data, stop)
-		if err != nil {
-			return nil, err
-		}
-		if i == expectedIndex {
-			buf.Write(data[1:20])
-		} else {
-			log.Warnf("pkg bluetooth; sending NACK, packet index is wrong")
-			buf.Write(data[:])
-			CmdNACK[1] = byte(expectedIndex)
-			b.WriteCmd(CmdNACK)
-		}
-		expectedIndex++
-	}
-	if fragments != 0 {
-		data, err := read(in.data, stop)
-		if err != nil {
-			return nil, err
-		}
-		len := data[1]
-		if len > 14 {
-			oneExtra = true
-			len = 14
-		}
-		checksum = data[2:6]
-		buf.Write(data[6 : len+6])
-	}
-	log.Tracef("pkg bluetooth; One extra: %t", oneExtra)
-	if oneExtra {
-		data, err := read(in.data, stop)
-		if err != nil {
-			return nil, err
-		}
-		buf.Write(data[2 : data[1]+2])
-	}
-	bytes := buf.Bytes()
-	sum := crc32.ChecksumIEEE(bytes)
-	if binary.BigEndian.Uint32(checksum) != sum {
-		log.Warnf("pkg bluetooth; checksum missmatch. checksum is: %x. want: %x", sum, checksum)
-		log.Warnf("pkg bluetooth; data: %s", hex.EncodeToString(bytes))
+	return b.readMessagePackets(first, in, stop)
+}
 
+// readMessagePackets reassembles a message that has begun with first, and
+// tells the phone how it went.
+func (b *Ble) readMessagePackets(first Packet, in *input, stop chan bool) (*message.Message, error) {
+	joiner, err := NewJoiner(first, b.profile.Layout)
+	if err != nil {
+		log.Warnf("pkg bluetooth; sending FAIL: %s", err)
 		b.WriteCmd(CmdFail)
-		return nil, errors.New("checksum missmatch")
+		return nil, err
+	}
+	for joiner.More() {
+		packet, err := read(in.data, stop)
+		if err != nil {
+			return nil, err
+		}
+		if err := joiner.Accumulate(packet); err != nil {
+			log.Warnf("pkg bluetooth; sending FAIL: %s", err)
+			b.WriteCmd(CmdFail)
+			return nil, err
+		}
+	}
+	body, err := joiner.Finalize()
+	if err != nil {
+		log.Warnf("pkg bluetooth; sending FAIL: %s", err)
+		b.WriteCmd(CmdFail)
+		return nil, err
 	}
 
 	b.WriteCmd(CmdSuccess)
 
-	msg, _err := message.Unmarshal(bytes)
+	msg, err := message.Unmarshal(body)
 	log.Tracef("pkg bluetooth; Received message: %s", spew.Sdump(msg))
-
-	return msg, _err
+	return msg, err
 }

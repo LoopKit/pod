@@ -23,14 +23,16 @@ import (
 // place of ImpossiBLE's menu bar app. Like that app it serves one client, and
 // a new connection takes over from the old one.
 type simRadio struct {
-	ble *Ble
-	id  string // the peripheral identifier the app sees
+	ble     *Ble
+	profile Profile
+	id      string // the peripheral identifier the app sees
 
 	mu        sync.Mutex
 	client    *simClient
 	scanning  bool
 	connected bool
 	podId     []byte
+	pdmId     uint32 // the controller an Omnipod 5 advertises once paired
 	state     AdvertState
 	notifying map[string]bool // characteristic ids
 	delayed   *time.Timer     // a connect held for its start delay
@@ -71,10 +73,6 @@ const (
 	propWriteNoResponse = 0x04
 	propWrite           = 0x08
 	propNotify          = 0x10
-
-	podServiceUUID = "1A7E4024-E3ED-4464-8B7E-751E03D0DC5F"
-	cmdCharUUID    = "1A7E2441-E3ED-4464-8B7E-751E03D0DC5F"
-	dataCharUUID   = "1A7E2442-E3ED-4464-8B7E-751E03D0DC5F"
 )
 
 // NewSimRadio serves the pod on ImpossiBLE's socket at path, as the
@@ -91,7 +89,7 @@ func NewSimRadio(b *Ble, path, id string, podId []byte) (Radio, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &simRadio{ble: b, id: id, podId: podId, notifying: map[string]bool{}}
+	r := &simRadio{ble: b, profile: b.profile, id: id, podId: podId, notifying: map[string]bool{}}
 	log.Infof("pkg bluetooth; serving the iOS Simulator on %s as peripheral %s", path, id)
 	go func() {
 		for {
@@ -183,7 +181,7 @@ func (r *simRadio) connect(c *simClient) {
 	c.send(map[string]interface{}{"type": "didConnect", "id": r.id})
 }
 
-func (r *simRadio) serviceID() string { return r.id + ":" + podServiceUUID }
+func (r *simRadio) serviceID() string { return r.id + ":" + r.profile.ServiceUUID }
 
 func (r *simRadio) charID(uuid string) string { return r.serviceID() + ":" + uuid }
 
@@ -241,12 +239,12 @@ func (r *simRadio) handle(c *simClient, msg map[string]interface{}) {
 		r.disconnect(c, "app")
 	case "discoverServices":
 		c.send(map[string]interface{}{"type": "didDiscoverServices", "id": id, "error": "",
-			"services": []map[string]interface{}{{"id": r.serviceID(), "uuid": podServiceUUID, "primary": true}}})
+			"services": []map[string]interface{}{{"id": r.serviceID(), "uuid": r.profile.ServiceUUID, "primary": true}}})
 	case "discoverCharacteristics":
 		serviceID := str(msg, "serviceId")
 		chars := []map[string]interface{}{}
 		if serviceID == r.serviceID() {
-			for _, u := range []string{cmdCharUUID, dataCharUUID} {
+			for _, u := range []string{r.profile.CmdCharUUID, r.profile.DataCharUUID} {
 				chars = append(chars, map[string]interface{}{"id": r.charID(u), "uuid": u,
 					"properties": propWrite | propWriteNoResponse | propNotify})
 			}
@@ -284,18 +282,16 @@ func (r *simRadio) handle(c *simClient, msg map[string]interface{}) {
 // advertising, which it does whenever it has no connection.
 func (r *simRadio) discovered() {
 	r.mu.Lock()
-	c, scanning, connected, podId, state := r.client, r.scanning, r.connected, r.podId, r.state
+	c, scanning, connected, podId, pdmId, state := r.client, r.scanning, r.connected, r.podId, r.pdmId, r.state
 	r.mu.Unlock()
 	if c == nil || !scanning || connected {
 		return
 	}
-	var uuids []string
-	for _, u := range AdvertisedServices(podId, state) {
-		uuids = append(uuids, fmt.Sprintf("%04X", u))
-	}
-	c.send(map[string]interface{}{"type": "didDiscover", "id": r.id, "name": AdvertisedName, "rssi": -60,
+	uuids := r.profile.AdvertisedServiceUUIDs(podId, pdmId, state)
+	name := r.profile.AdvertisedName(pdmId)
+	c.send(map[string]interface{}{"type": "didDiscover", "id": r.id, "name": name, "rssi": -60,
 		"adv": map[string]interface{}{
-			"kCBAdvDataLocalName":        AdvertisedName,
+			"kCBAdvDataLocalName":        name,
 			"kCBAdvDataIsConnectable":    true,
 			"kCBAdvDataServiceUUIDs":     uuids,
 			"kCBAdvDataManufacturerData": base64.StdEncoding.EncodeToString(state.ManufacturerData()),
@@ -312,7 +308,7 @@ func (r *simRadio) write(c *simClient, msg map[string]interface{}) {
 	switch {
 	case err != nil:
 		reply["error"] = "bad value"
-	case charID != r.charID(cmdCharUUID) && charID != r.charID(dataCharUUID):
+	case charID != r.charID(r.profile.CmdCharUUID) && charID != r.charID(r.profile.DataCharUUID):
 		reply["error"] = "unknown characteristic"
 	case !connected:
 		reply["error"] = "not connected"
@@ -323,7 +319,7 @@ func (r *simRadio) write(c *simClient, msg map[string]interface{}) {
 	if reply["error"] != "" {
 		return
 	}
-	if charID == r.charID(cmdCharUUID) {
+	if charID == r.charID(r.profile.CmdCharUUID) {
 		log.Tracef("received CMD,  %x", data)
 		r.ble.CmdWritten(data)
 	} else {
@@ -342,7 +338,7 @@ func (r *simRadio) setNotify(c *simClient, msg map[string]interface{}) {
 		"enabled": enabled, "error": ""}
 	r.mu.Lock()
 	switch {
-	case charID != r.charID(cmdCharUUID) && charID != r.charID(dataCharUUID):
+	case charID != r.charID(r.profile.CmdCharUUID) && charID != r.charID(r.profile.DataCharUUID):
 		reply["error"] = "unknown characteristic"
 	case !r.connected:
 		reply["error"] = "not connected"
@@ -354,7 +350,7 @@ func (r *simRadio) setNotify(c *simClient, msg map[string]interface{}) {
 		reply["enabled"] = false
 	}
 	c.send(reply)
-	if enabled && charID == r.charID(dataCharUUID) && reply["error"] == "" {
+	if enabled && charID == r.charID(r.profile.DataCharUUID) && reply["error"] == "" {
 		log.Infof("     *** OK to send commands from the phone app ***")
 	}
 }
@@ -375,13 +371,16 @@ func (r *simRadio) notify(uuid string, packet Packet) error {
 	return nil
 }
 
-func (r *simRadio) NotifyCmd(packet Packet) error { return r.notify(cmdCharUUID, packet) }
+func (r *simRadio) NotifyCmd(packet Packet) error { return r.notify(r.profile.CmdCharUUID, packet) }
 
-func (r *simRadio) NotifyData(packet Packet) error { return r.notify(dataCharUUID, packet) }
+func (r *simRadio) NotifyData(packet Packet) error { return r.notify(r.profile.DataCharUUID, packet) }
 
-func (r *simRadio) Advertise(podId []byte) error {
+func (r *simRadio) Advertise(podId []byte, pdmId uint32) error {
 	r.mu.Lock()
 	r.podId = podId
+	if pdmId != 0 {
+		r.pdmId = pdmId
+	}
 	r.mu.Unlock()
 	r.discovered()
 	return nil
@@ -397,6 +396,9 @@ func (r *simRadio) AdvertiseState(state AdvertState) error {
 	}
 	return nil
 }
+
+// LinkMTU is 0: ImpossiBLE carries whole packets, so it has no ATT MTU.
+func (r *simRadio) LinkMTU() int { return 0 }
 
 // Disconnect is the pod hanging up.
 func (r *simRadio) Disconnect() {

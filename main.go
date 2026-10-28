@@ -20,8 +20,15 @@ func main() {
 	var apiAddr = flag.String("api", ":8080", "address of the control panel and its API")
 	var transport = flag.String("transport", "ble", "ble (a Linux Bluetooth adapter) or impossible (ImpossiBLE's socket, for an app in the iOS Simulator)")
 	var socket = flag.String("socket", "/tmp/impossible.sock", "ImpossiBLE socket for -transport impossible")
+	var hci = flag.Int("hci", -1, "Bluetooth adapter to serve the pod from: 0 for hci0, -1 for the first with LE support. An Omnipod 5 needs a Bluetooth 4.2 or later radio, so name the dongle rather than a Pi 3B's own")
+	var modeName = flag.String("mode", string(bluetooth.ModeDash), "the pod to simulate: dash or o5 (Omnipod 5)")
 
 	flag.Parse()
+
+	mode, err := bluetooth.ParseMode(*modeName)
+	if err != nil {
+		log.Fatalf("%s", err)
+	}
 
 	if *traceLevel {
 		log.SetLevel(log.TraceLevel)
@@ -32,21 +39,30 @@ func main() {
 	}
 
 	log.SetFormatter(&logrus.TextFormatter{
-		DisableQuote: true,
-		ForceColors:  true,
+		DisableQuote:  true,
+		ForceColors:   true,
 		FullTimestamp: true,
 	})
 
 	var state *pod.PODState
 	if *freshState {
-		state = pod.NewFreshState(*stateFile)
+		state = pod.NewFreshState(*stateFile, mode)
 	} else {
-		var err error
 		state, err = pod.NewState(*stateFile)
 		if err != nil {
 			log.Fatalf("pkg pod; could not restore pod state from %s: %+v", *stateFile, err)
 		}
+		// The pod the phone paired with is the one in the state file. A
+		// different -mode would change the pod under the phone, so it is
+		// ignored; -fresh starts a new pod of whatever mode is asked for.
+		if saved := state.PodMode(); saved != mode {
+			log.Warnf("%s holds an %s pod; keeping it. Use -fresh to start a new %s pod",
+				*stateFile, saved.Description(), mode.Description())
+			mode = saved
+		}
 	}
+	log.Infof("simulating an %s pod", mode.Description())
+	profile := bluetooth.ProfileFor(mode)
 	if state.PeripheralID == "" {
 		state.PeripheralID = bluetooth.PeripheralID()
 	}
@@ -56,7 +72,7 @@ func main() {
 	var attach func(*bluetooth.Ble) (bluetooth.Radio, error)
 	switch *transport {
 	case "ble":
-		attach = func(b *bluetooth.Ble) (bluetooth.Radio, error) { return bluetooth.NewGattRadio(b, state.Id) }
+		attach = func(b *bluetooth.Ble) (bluetooth.Radio, error) { return bluetooth.NewGattRadio(b, state.Id, *hci) }
 	case "impossible":
 		attach = func(b *bluetooth.Ble) (bluetooth.Radio, error) {
 			return bluetooth.NewSimRadio(b, *socket, state.PeripheralID, state.Id)
@@ -64,7 +80,7 @@ func main() {
 	default:
 		log.Fatalf("transport %q: want ble or impossible", *transport)
 	}
-	ble, err := bluetooth.New(attach)
+	ble, err := bluetooth.New(attach, profile)
 	if err != nil {
 		log.Fatalf("Could not start %s: %s", *transport, err)
 	}

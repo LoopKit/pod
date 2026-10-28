@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/avereha/pod/pkg/aid"
 	"github.com/avereha/pod/pkg/bluetooth"
 	"github.com/avereha/pod/pkg/command"
 	"github.com/avereha/pod/pkg/eap"
@@ -33,6 +34,7 @@ type PodMsgBody struct {
 type Pod struct {
 	ble            *bluetooth.Ble
 	state          *PODState
+	aid            *aid.Store
 	mtx            sync.Mutex
 	webMessageHook func([]byte)
 
@@ -50,6 +52,7 @@ func New(ble *bluetooth.Ble, state *PODState) *Pod {
 	ret := &Pod{
 		ble:   ble,
 		state: state,
+		aid:   aid.NewStore(),
 	}
 	ret.takeSnapshot()
 	return ret
@@ -84,6 +87,17 @@ func (p *Pod) StartAcceptingCommands() {
 	log.Infof("pkg pod; Listening for commands")
 	firstCmd, _ := p.ble.ReadCmd()
 	log.Infof("pkg pod; got first command: as string: %s", firstCmd)
+	if pdmId, ok := bluetooth.O5PdmIdFromHello(firstCmd); ok {
+		log.Infof("pkg pod; HELLO from controller %08x", pdmId)
+		if p.isO5() {
+			// An Omnipod 5 puts its controller's id in the one service
+			// UUID it advertises, so the phone can find its own pod.
+			p.mtx.Lock()
+			p.state.PdmId = pdmId
+			p.mtx.Unlock()
+			p.ble.SetPdmId(pdmId)
+		}
+	}
 
 	p.ble.StartMessageLoop()
 
@@ -110,6 +124,17 @@ func (p *Pod) readSetup() (*message.Message, bool) {
 	}
 }
 
+// isO5 says whether this pod is simulating an Omnipod 5.
+func (p *Pod) isO5() bool { return p.ble.Profile().Mode.IsO5() }
+
+// product is what the pod reports in its version responses.
+func (p *Pod) product() response.Product {
+	if p.isO5() {
+		return response.Omnipod5Product()
+	}
+	return response.DashProduct()
+}
+
 // startOver hangs up on a phone whose message the pod can't use. The phone
 // reconnects and sets up a new session.
 func (p *Pod) startOver(format string, args ...interface{}) {
@@ -119,6 +144,10 @@ func (p *Pod) startOver(format string, args ...interface{}) {
 }
 
 func (p *Pod) StartActivation() {
+	if p.isO5() {
+		p.startO5Activation()
+		return
+	}
 
 	pair := &pair.Pair{}
 	msg, ok := p.readSetup()
@@ -286,6 +315,18 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 			return
 		}
 		if didTimeout {
+			// A pod being activated holds its connection: the user is
+			// filling, priming, attaching and inserting it, which takes
+			// longer than this, and a real pod does not hang up partway
+			// through. Only a pod that is running drops an idle link, the
+			// way some DASH pods do every few minutes.
+			p.mtx.Lock()
+			activating := p.state.PodProgress < response.PodProgressRunningAbove50U
+			p.mtx.Unlock()
+			if activating {
+				log.Infof("pkg pod; idle while being activated — holding the connection")
+				continue
+			}
 			p.ble.ShutdownConnection()
 			go func() {
 				p.StartAcceptingCommands()
@@ -304,6 +345,11 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		// Lock mutex before we start using/modifying state
 		p.mtx.Lock()
 
+		// A signed message's signature covers its header and its payload
+		// while that is still encrypted, so both have to be taken now:
+		// decrypting replaces the payload in place.
+		msgType, signature, signingInput := msg.Type, msg.Signature, msg.SigningInput()
+
 		decrypted, err := encrypt.DecryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, msg)
 		if err != nil {
 			p.mtx.Unlock()
@@ -311,6 +357,45 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 			return
 		}
 		p.state.NonceSeq++
+
+		// An Omnipod 5 is sent its setup commands on this same transport
+		// before it is set up. They are not command blocks, and their
+		// payloads are short ASCII — "G3.12" is five bytes — so this has to
+		// come before the command-length guard below.
+		if p.isO5() && aid.Looks(decrypted.Payload) {
+			if !p.handleAidCommand(decrypted.Payload, msg.Source, msg.Destination, msg.SequenceNumber) {
+				p.state.Save()
+				p.takeSnapshot()
+				p.mtx.Unlock()
+				p.startOver("could not answer the AID command")
+				return
+			}
+			// The phone acknowledges an AID answer as it does any other
+			// response (sendO5AidCommand), and that acknowledgement carries
+			// a nonce of its own.
+			ack, reconnected := p.readResponseAck()
+			if ack == nil {
+				p.state.Save()
+				p.takeSnapshot()
+				p.mtx.Unlock()
+				log.Infof("pkg pod; no AID answer ACK — re-establishing session")
+				if !reconnected {
+					p.ble.ShutdownConnection()
+				}
+				go p.StartAcceptingCommands()
+				return
+			}
+			err := p.consumeAck(ack)
+			p.state.Save()
+			p.takeSnapshot()
+			p.mtx.Unlock()
+			if err != nil {
+				p.startOver("could not read the AID answer ACK: %s", err)
+				return
+			}
+			p.notifyStateChange()
+			continue
+		}
 
 		if len(decrypted.Payload) < 16 {
 			p.mtx.Unlock()
@@ -341,19 +426,34 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		}
 		log.Tracef("pkg pod; command pod message body = %x", pMsg.MsgBodyCommand)
 
-		p.handleCommand(cmd)
-
 		var rsp response.Response
-		if cmd.IsResponseHardcoded() {
-			rsp, err = cmd.GetResponse()
-			if err != nil {
-				log.Fatalf("pkg pod; could not get command response: %s", err)
-			}
+		if refusal := p.checkO5Signature(cmd, msgType, signature, signingInput); refusal != nil {
+			// The command is not carried out: a real pod answers an
+			// unsigned insulin or cancel command with an error and leaves
+			// its delivery alone.
+			rsp = refusal
 		} else {
-			rsp = p.getResponse(cmd)
+			p.handleCommand(cmd)
+
+			if cmd.IsResponseHardcoded() {
+				rsp, err = cmd.GetResponse()
+				if err != nil {
+					log.Fatalf("pkg pod; could not get command response: %s", err)
+				}
+				// The phone checks the product id against the pod type the
+				// user chose, and decodes the lot number for the UI.
+				switch r := rsp.(type) {
+				case *response.VersionResponse:
+					r.Product = p.product()
+				case *response.SetUniqueID:
+					r.Product = p.product()
+				}
+			} else {
+				rsp = p.getResponse(cmd)
+			}
 		}
 
-		if cmd.GetType() == command.SET_UNIQUE_ID {
+		if _, refused := rsp.(*response.ErrorResponse); !refused && cmd.GetType() == command.SET_UNIQUE_ID {
 			// Set the unique ID
 			log.Tracef("SET_UNIQUE_ID cmd.GetPayload() %x", cmd.GetPayload())
 			uniqueId := cmd.GetPayload()
@@ -397,7 +497,7 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 		p.ble.WriteMessage(msg)
 
 		log.Debugf("pkg pod; reading response ACK. Nonce seq %d", p.state.NonceSeq)
-		msg, _, didReconnect = p.ble.ReadMessageWithTimeout(3 * time.Minute)
+		msg, didReconnect = p.readResponseAck()
 		if msg == nil {
 			// The phone never acknowledged; it will ask again on its next session.
 			p.state.Save()
@@ -411,13 +511,7 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 			return
 		}
 		// TODO check for SEQ numbers here and the Ack flag
-		decrypted, err = encrypt.DecryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, msg)
-		if err == nil {
-			p.state.NonceSeq++
-			if len(decrypted.Payload) != 0 {
-				err = fmt.Errorf("not an empty ACK: %s", spew.Sdump(msg))
-			}
-		}
+		err = p.consumeAck(msg)
 		p.state.Save()
 		p.takeSnapshot()
 		p.mtx.Unlock()
@@ -431,12 +525,47 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 	}
 }
 
+// readResponseAck waits for the phone to acknowledge a response the pod
+// has just sent. A nil message means the phone never answered, and the
+// second value says whether it came back on a new connection.
+func (p *Pod) readResponseAck() (*message.Message, bool) {
+	msg, _, didReconnect := p.ble.ReadMessageWithTimeout(3 * time.Minute)
+	return msg, didReconnect
+}
+
+// consumeAck decrypts an acknowledgement and advances the nonce it used.
+// An acknowledgement carries no payload; anything else means the pod and
+// the phone no longer agree on where they are.
+func (p *Pod) consumeAck(msg *message.Message) error {
+	decrypted, err := encrypt.DecryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, msg)
+	if err != nil {
+		return fmt.Errorf("could not decrypt the acknowledgement: %s", err)
+	}
+	p.state.NonceSeq++
+	if len(decrypted.Payload) != 0 {
+		return fmt.Errorf("expected an empty acknowledgement, got %x", decrypted.Payload)
+	}
+	return nil
+}
+
+// encryptAndSend encrypts a message under the session key and writes it
+// to the phone, advancing the nonce the way an answer does.
+func (p *Pod) encryptAndSend(msg *message.Message) error {
+	out, err := encrypt.EncryptMessage(p.state.CK, p.state.NoncePrefix, p.state.NonceSeq, msg)
+	if err != nil {
+		return err
+	}
+	p.state.NonceSeq++
+	p.ble.WriteMessage(out)
+	return nil
+}
+
 func (p *Pod) makeGeneralStatusResponse() response.Response {
 	log.Debugf("pkg pod; General status response LastProgSeqNum = %d", p.state.LastProgSeqNum)
 
 	var now = time.Now()
 
-	return &response.GeneralStatusResponse {
+	return &response.GeneralStatusResponse{
 		LastProgSeqNum:      p.state.LastProgSeqNum,
 		Reservoir:           p.state.Reservoir,
 		Alerts:              p.state.ActiveAlertSlots,
@@ -455,7 +584,7 @@ func (p *Pod) makeDetailedStatusResponse() response.Response {
 
 	var now = time.Now()
 
-	return &response.DetailedStatusResponse {
+	return &response.DetailedStatusResponse{
 		LastProgSeqNum:      p.state.LastProgSeqNum,
 		Reservoir:           p.state.Reservoir,
 		Alerts:              p.state.ActiveAlertSlots,
@@ -474,17 +603,17 @@ func (p *Pod) makeDetailedStatusResponse() response.Response {
 
 func (p *Pod) makeType1StatusResponse() response.Response {
 
-	return &response.Type1StatusResponse {
-		TriggeredAlerts:     p.state.TriggerTimes,
+	return &response.Type1StatusResponse{
+		TriggeredAlerts: p.state.TriggerTimes,
 	}
 }
 
 func (p *Pod) makeType3StatusResponse() response.Response {
 
-	return &response.Type3StatusResponse {
-		FaultEvent:          p.state.FaultEvent,
-		FaultEventTime:      p.state.FaultTime,
-		MinutesActive:       p.state.MinutesActive(),
+	return &response.Type3StatusResponse{
+		FaultEvent:     p.state.FaultEvent,
+		FaultEventTime: p.state.FaultTime,
+		MinutesActive:  p.state.MinutesActive(),
 	}
 }
 
@@ -492,14 +621,14 @@ func (p *Pod) makeType5StatusResponse() response.Response {
 
 	var activationTime = p.state.ActivationTime
 
-	return &response.Type5StatusResponse {
-		FaultEvent:          p.state.FaultEvent,
-		FaultEventTime:      p.state.FaultTime,
-		Year:                uint8(activationTime.Year() - 2000),
-		Month:               uint8(activationTime.Month()),
-		Day:                 uint8(activationTime.Day()),
-		Hour:                uint8(activationTime.Hour()),
-		Minute:              uint8(activationTime.Minute()),
+	return &response.Type5StatusResponse{
+		FaultEvent:     p.state.FaultEvent,
+		FaultEventTime: p.state.FaultTime,
+		Year:           uint8(activationTime.Year() - 2000),
+		Month:          uint8(activationTime.Month()),
+		Day:            uint8(activationTime.Day()),
+		Hour:           uint8(activationTime.Hour()),
+		Minute:         uint8(activationTime.Minute()),
 	}
 }
 
@@ -507,7 +636,7 @@ func (p *Pod) getResponse(cmd command.Command) response.Response {
 	var rsp response.Response
 
 	getStatus, isStatusRequest := cmd.(*command.GetStatus)
-	if p.state.MinutesActive() >= 80 * 60 && p.state.FaultEvent == 0 {
+	if p.state.MinutesActive() >= 80*60 && p.state.FaultEvent == 0 {
 		p.state.FaultEvent = 0x1C // 0x1C = exceeded maximum pod life of 80 hours
 	}
 	if !isStatusRequest || getStatus.RequestType == 0 || getStatus.RequestType == 7 {

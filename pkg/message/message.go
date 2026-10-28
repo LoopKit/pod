@@ -14,7 +14,13 @@ const (
 	MessageTypeEncrypted
 	MessageTypeSessionEstablishment
 	MessageTypePairing
-	MagicPattern = "TW"
+	// MessageTypeEncryptedSigned carries an ECDSA signature after the
+	// payload. Omnipod 5 pods require it for the commands that deliver or
+	// stop insulin (OmnipodKit's MessageType.ENCRYPTED_SIGNED).
+	MessageTypeEncryptedSigned
+
+	MagicPattern    = "TW"
+	SignatureLength = 64 // ECDSA P-256, r||s
 )
 
 // Message is one CTwiPacket
@@ -29,12 +35,15 @@ type Message struct {
 	Source           []byte
 	Destination      []byte
 	Payload          []byte
-	Raw              []byte
-	Sas              bool
-	Tfs              bool
-	SequenceNumber   uint8
-	AckNumber        uint8
-	Version          uint16
+	// Signature is the 64 bytes after the payload of a signed message. It
+	// is not counted in the header's length field.
+	Signature      []byte
+	Raw            []byte
+	Sas            bool
+	Tfs            bool
+	SequenceNumber uint8
+	AckNumber      uint8
+	Version        uint16
 }
 
 type flag byte
@@ -69,7 +78,7 @@ func NewMessage(t MessageType, source, destination []byte) *Message {
 
 func (m *Message) Marshal() ([]byte, error) {
 	var buf bytes.Buffer
-	if m.Type == MessageTypeEncrypted && m.EncryptedPayload { // Already encrypted
+	if m.HasTag() && m.EncryptedPayload { // Already encrypted
 		return m.Raw, nil
 	}
 
@@ -111,6 +120,9 @@ func (m *Message) Marshal() ([]byte, error) {
 	if m.Payload != nil {
 		buf.Write(m.Payload)
 	}
+	if m.Signature != nil {
+		buf.Write(m.Signature)
+	}
 
 	ret := make([]byte, buf.Len())
 	copy(ret, buf.Bytes())
@@ -143,7 +155,7 @@ func Unmarshal(data []byte) (*Message, error) {
 	ret.Gateway = f.get(3) == 1
 	ret.Type = MessageType(f.get(7) | f.get(6)<<1 | f.get(5)<<2 | f.get(4)<<3)
 
-	if ret.Type > MessageTypePairing {
+	if ret.Type > MessageTypeEncryptedSigned {
 		return nil, fmt.Errorf("invalid message type found in %x", data)
 	}
 	if ret.Version != 0 {
@@ -151,18 +163,51 @@ func Unmarshal(data []byte) (*Message, error) {
 	}
 	ret.SequenceNumber = data[4]
 	ret.AckNumber = data[5]
-	var n = data[6]<<3 | data[7]>>5
+	// The length is 11 bits across two bytes, so it has to be read wider
+	// than a byte: an Omnipod 5 pairing message runs past 1000 bytes.
+	n := uint16(data[6])<<3 | uint16(data[7])>>5
 	if int(n) > len(data)-16 {
 		spew.Dump(ret)
 		return nil, fmt.Errorf("received length is too big in %x. Length:%d . remaining: %d", data, n, len(data)-16)
 	}
 	ret.Source = data[8:12]
 	ret.Destination = data[12:16]
-	if ret.Type == MessageTypeEncrypted {
-		ret.Payload = data[16 : 16+n+8]
-		ret.EncryptedPayload = true
-	} else {
+	if !ret.HasTag() {
 		ret.Payload = data[16 : 16+n]
+		return ret, nil
+	}
+
+	// An encrypted payload is followed by its 8-byte authentication tag,
+	// which the length field leaves out.
+	end := 16 + int(n) + 8
+	if end > len(data) {
+		return nil, fmt.Errorf("message claims %d encrypted bytes but holds %d in %x", int(n)+8, len(data)-16, data)
+	}
+	ret.Payload = data[16:end]
+	ret.EncryptedPayload = true
+
+	if ret.Type == MessageTypeEncryptedSigned {
+		if end+SignatureLength > len(data) {
+			return nil, fmt.Errorf("signed message has %d bytes after its payload, want %d, in %x", len(data)-end, SignatureLength, data)
+		}
+		ret.Signature = data[end : end+SignatureLength]
 	}
 	return ret, nil
+}
+
+// HasTag says whether the payload ends in an AES-CCM authentication tag
+// that the header's length field does not count.
+func (m *Message) HasTag() bool {
+	return m.Type == MessageTypeEncrypted || m.Type == MessageTypeEncryptedSigned
+}
+
+// SigningInput is what a signed message's signature covers: the 16-byte
+// header as it goes on the wire, then the encrypted payload and its tag
+// (OmnipodKit's BlePodMessageTransport.getCmdMessage).
+func (m *Message) SigningInput() []byte {
+	if len(m.Raw) < 16 {
+		return nil
+	}
+	out := append([]byte(nil), m.Raw[:16]...)
+	return append(out, m.Payload...)
 }

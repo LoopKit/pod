@@ -42,8 +42,9 @@ func (r *radio) NotifyData(p bluetooth.Packet) error {
 	return nil
 }
 
-func (r *radio) Advertise([]byte) error                     { return nil }
+func (r *radio) Advertise([]byte, uint32) error             { return nil }
 func (r *radio) AdvertiseState(bluetooth.AdvertState) error { return nil }
+func (r *radio) LinkMTU() int                               { return 0 }
 
 func (r *radio) Disconnect() {
 	select {
@@ -53,7 +54,7 @@ func (r *radio) Disconnect() {
 }
 
 func newBle(t *testing.T, r *radio) *bluetooth.Ble {
-	b, err := bluetooth.New(func(*bluetooth.Ble) (bluetooth.Radio, error) { return r, nil })
+	b, err := bluetooth.New(func(*bluetooth.Ble) (bluetooth.Radio, error) { return r, nil }, bluetooth.ProfileFor(bluetooth.ModeDash))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,7 +68,7 @@ func TestAGarbledSessionMessageHangsUp(t *testing.T) {
 	toPod.peer = podBle
 	toPhone.peer = phone
 
-	state := NewFreshState(filepath.Join(t.TempDir(), "state.toml"))
+	state := NewFreshState(filepath.Join(t.TempDir(), "state.toml"), bluetooth.ModeDash)
 	state.LTK = make([]byte, 16)
 	p := New(podBle, state)
 
@@ -140,7 +141,7 @@ func TestAStaleSqnGetsASynchronizationFailure(t *testing.T) {
 	toPhone.peer = phone
 
 	ltk := bytes.Repeat([]byte{0x5a}, 16)
-	state := NewFreshState(filepath.Join(t.TempDir(), "state.toml"))
+	state := NewFreshState(filepath.Join(t.TempDir(), "state.toml"), bluetooth.ModeDash)
 	state.LTK = ltk
 	state.EapAkaSeq = 40
 	p := New(podBle, state)
@@ -208,7 +209,7 @@ func TestABadAutnHangsUp(t *testing.T) {
 	toPod.peer = podBle
 	toPhone.peer = phone
 
-	state := NewFreshState(filepath.Join(t.TempDir(), "state.toml"))
+	state := NewFreshState(filepath.Join(t.TempDir(), "state.toml"), bluetooth.ModeDash)
 	state.LTK = bytes.Repeat([]byte{0x5a}, 16)
 	p := New(podBle, state)
 

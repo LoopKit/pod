@@ -147,6 +147,12 @@ func (d *device) Advertise(a *AdvPacket) error {
 }
 
 func (d *device) AdvertiseNameAndServices(name string, uu []UUID) error {
+	// PATCHED for github.com/LoopKit/pod: the name-overflow branch declared a
+	// second `a` that shadowed this one, so it built the scan response and
+	// then advertised the shadowed-away packet. It only showed once something
+	// did not fit, which is every advertisement carrying a 128-bit UUID.
+	//
+	// Restore this after `go mod vendor`.
 	a := &AdvPacket{}
 	a.AppendFlags(flagGeneralDiscoverable | flagLEOnly)
 	a.AppendUUIDFit(uu)
@@ -155,11 +161,11 @@ func (d *device) AdvertiseNameAndServices(name string, uu []UUID) error {
 		a.AppendName(name)
 		d.scanResp = nil
 	} else {
-		a := &AdvPacket{}
-		a.AppendName(name)
+		resp := &AdvPacket{}
+		resp.AppendName(name)
 		d.scanResp = &cmd.LESetScanResponseData{
-			ScanResponseDataLength: uint8(a.Len()),
-			ScanResponseData:       a.Bytes(),
+			ScanResponseDataLength: uint8(resp.Len()),
+			ScanResponseData:       resp.Bytes(),
 		}
 	}
 
