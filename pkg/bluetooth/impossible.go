@@ -288,7 +288,7 @@ func (r *simRadio) discovered() {
 		return
 	}
 	uuids := r.profile.AdvertisedServiceUUIDs(podId, pdmId, state)
-	name := r.profile.AdvertisedName(pdmId)
+	name := r.profile.AdvertisedName()
 	c.send(map[string]interface{}{"type": "didDiscover", "id": r.id, "name": name, "rssi": -60,
 		"adv": map[string]interface{}{
 			"kCBAdvDataLocalName":        name,

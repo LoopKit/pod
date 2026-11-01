@@ -3,8 +3,6 @@ package bluetooth
 import (
 	"encoding/binary"
 	"fmt"
-
-	"github.com/avereha/pod/pkg/response"
 )
 
 // Mode is the kind of pod being simulated. It decides the BLE profile, the
@@ -142,15 +140,15 @@ func O5PdmIdFromHello(cmd []byte) (uint32, bool) {
 // its scan response when a 128-bit service UUID has filled the advertisement.
 //
 // A real Omnipod 5 names itself "AP <controller id> <lot><tid>", captured from
-// a pod as "AP FFFFFFFE 0E977731000A3AB7" before it was paired. A DASH keeps
-// the name this simulator has always used.
-func (p Profile) AdvertisedName(pdmId uint32) string {
-	if !p.Mode.IsO5() {
-		return AdvertisedName
+// a pod as "AP FFFFFFFE 0E977731000A3AB7" before it was paired. Nothing reads
+// the name, so a simulated one just says what it is. A DASH keeps the name
+// this simulator has always used.
+func (p Profile) AdvertisedName() string {
+	if p.Mode.IsO5() {
+		return O5AdvertisedName
 	}
-	id := O5NotPairedPdmId
-	if pdmId != 0 {
-		id = pdmId
-	}
-	return fmt.Sprintf("AP %08X %08X%08X", id, response.LotOmnipod5, response.Tid)
+	return AdvertisedName
 }
+
+// O5AdvertisedName is the local name a simulated Omnipod 5 advertises.
+const O5AdvertisedName = "pod simulator"
