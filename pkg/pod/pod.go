@@ -89,9 +89,12 @@ func (p *Pod) StartAcceptingCommands() {
 	log.Infof("pkg pod; got first command: as string: %s", firstCmd)
 	if pdmId, ok := bluetooth.O5PdmIdFromHello(firstCmd); ok {
 		log.Infof("pkg pod; HELLO from controller %08x", pdmId)
-		if p.isO5() {
-			// An Omnipod 5 puts its controller's id in the one service
-			// UUID it advertises, so the phone can find its own pod.
+		if p.isO5() && p.state.LTK != nil {
+			// A paired Omnipod 5 puts its controller's id in the one service
+			// UUID it advertises, so the phone can find its own pod. An
+			// unpaired one keeps advertising as pairable until pairing
+			// completes, so a phone that abandons the exchange can find it
+			// again.
 			p.mtx.Lock()
 			p.state.PdmId = pdmId
 			p.mtx.Unlock()
