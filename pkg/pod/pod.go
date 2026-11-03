@@ -47,6 +47,7 @@ type Pod struct {
 // Once one of these are set, the next command will crash the executable.
 var crashBeforeProcessingCommand bool
 var crashAfterProcessingCommand bool
+var ignoreMessages int
 
 func New(ble *bluetooth.Ble, state *PODState) *Pod {
 	ret := &Pod{
@@ -337,6 +338,17 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 			return
 		}
 		log.Tracef("pkg pod; got command message: %s", spew.Sdump(msg))
+
+		p.mtx.Lock()
+		ignore := ignoreMessages > 0
+		if ignore {
+			ignoreMessages--
+		}
+		p.mtx.Unlock()
+		if ignore {
+			log.Infof("pkg pod; ignoring message seq %d (ignoreNextMessages)", msg.SequenceNumber)
+			continue
+		}
 
 		if msg.SequenceNumber == lastMsgSeq {
 			// this is a retry because we did not answer yet
@@ -832,6 +844,14 @@ func (p *Pod) SetActiveTime(newVal int) {
 	p.state.ActivationTime = time.Now().Add(-time.Duration(newVal) * time.Minute)
 	p.state.Save()
 	p.takeSnapshot()
+	p.mtx.Unlock()
+}
+
+// IgnoreNextMessages makes the pod stay connected but not answer the next
+// count messages, as a pod that didn't hear them would.
+func (p *Pod) IgnoreNextMessages(count int) {
+	p.mtx.Lock()
+	ignoreMessages = count
 	p.mtx.Unlock()
 }
 
