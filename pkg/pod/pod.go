@@ -820,8 +820,7 @@ func (p *Pod) SetAlerts(newVal uint8) {
 
 func (p *Pod) SetFault(newVal uint8) {
 	p.mtx.Lock()
-	p.state.FaultEvent = newVal
-	p.state.FaultTime = p.state.MinutesActive()
+	p.state.SetFault(newVal)
 	p.state.Save()
 	p.takeSnapshot()
 	p.mtx.Unlock()
