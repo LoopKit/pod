@@ -854,6 +854,12 @@ func (p *Pod) IgnoreNextMessages(count int) {
 	p.mtx.Unlock()
 }
 
+// FailNextConnects makes the next count connects fail at service
+// discovery, with the pod hanging up after hangUpAfter.
+func (p *Pod) FailNextConnects(count int, hangUpAfter time.Duration) error {
+	return p.ble.FailNextConnects(count, hangUpAfter)
+}
+
 func (p *Pod) CrashNextCommand(beforeProcessing bool) {
 	p.mtx.Lock()
 	if beforeProcessing {

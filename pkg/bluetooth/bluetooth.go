@@ -198,6 +198,20 @@ func (b *Ble) Disconnected() {
 	b.genMtx.Unlock()
 }
 
+// FailNextConnects makes the next count connects fail: service discovery
+// goes unanswered and the pod hangs up after hangUpAfter. Only the
+// ImpossiBLE transport can do this.
+func (b *Ble) FailNextConnects(count int, hangUpAfter time.Duration) error {
+	r, ok := b.radio.(interface {
+		FailNextConnects(int, time.Duration)
+	})
+	if !ok {
+		return fmt.Errorf("failNextConnects needs -transport impossible")
+	}
+	r.FailNextConnects(count, hangUpAfter)
+	return nil
+}
+
 // IsConnected says whether the phone is connected.
 func (b *Ble) IsConnected() bool {
 	b.genMtx.Lock()
