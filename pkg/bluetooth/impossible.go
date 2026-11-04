@@ -36,6 +36,22 @@ type simRadio struct {
 	state     AdvertState
 	notifying map[string]bool // characteristic ids
 	delayed   *time.Timer     // a connect held for its start delay
+
+	failConnects int           // connects left to fail, see FailNextConnects
+	hangUpAfter  time.Duration // how long a failing connect lasts
+	stalling     bool          // this connection leaves service discovery unanswered
+	hangUp       *time.Timer   // the failing connection's hang-up
+}
+
+// FailNextConnects makes the next count connects fail as some pods do in
+// the field: the link comes up, service discovery is never answered, and
+// the pod hangs up after hangUpAfter with CoreBluetooth's "peripheral
+// disconnected" error.
+func (r *simRadio) FailNextConnects(count int, hangUpAfter time.Duration) {
+	r.mu.Lock()
+	r.failConnects = count
+	r.hangUpAfter = hangUpAfter
+	r.mu.Unlock()
 }
 
 type simClient struct {
@@ -169,13 +185,23 @@ func (r *simRadio) connect(c *simClient) {
 	}
 	r.delayed = nil
 	already := r.connected
+	failing := false
 	if !already {
 		r.connected = true
 		r.notifying = map[string]bool{}
+		if r.failConnects > 0 {
+			r.failConnects--
+			r.stalling = true
+			failing = true
+			r.hangUp = time.AfterFunc(r.hangUpAfter, func() { r.remoteHangUp(c) })
+		}
 	}
 	r.mu.Unlock()
 	if !already {
 		log.Infof("pkg bluetooth; ** New connection from: %s", c.bundle)
+		if failing {
+			log.Infof("pkg bluetooth; failing this connection: no service discovery, hanging up after %v (failNextConnects)", r.hangUpAfter)
+		}
 		r.ble.Connected()
 	}
 	c.send(map[string]interface{}{"type": "didConnect", "id": r.id})
@@ -238,9 +264,17 @@ func (r *simRadio) handle(c *simClient, msg map[string]interface{}) {
 		r.mu.Unlock()
 		r.disconnect(c, "app")
 	case "discoverServices":
+		if r.isStalling() {
+			log.Infof("pkg bluetooth; leaving service discovery unanswered (failNextConnects)")
+			return
+		}
 		c.send(map[string]interface{}{"type": "didDiscoverServices", "id": id, "error": "",
 			"services": []map[string]interface{}{{"id": r.serviceID(), "uuid": r.profile.ServiceUUID, "primary": true}}})
 	case "discoverCharacteristics":
+		if r.isStalling() {
+			log.Infof("pkg bluetooth; leaving characteristic discovery unanswered (failNextConnects)")
+			return
+		}
 		serviceID := str(msg, "serviceId")
 		chars := []map[string]interface{}{}
 		if serviceID == r.serviceID() {
@@ -409,15 +443,41 @@ func (r *simRadio) Disconnect() {
 }
 
 func (r *simRadio) disconnect(c *simClient, by string) {
+	r.disconnectWithError(c, by, nil)
+}
+
+func (r *simRadio) isStalling() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.stalling
+}
+
+// remoteHangUp ends a failing connection the way a pod does, with
+// CBErrorPeripheralDisconnected.
+func (r *simRadio) remoteHangUp(c *simClient) {
+	r.disconnectWithError(c, "pod (failNextConnects)", map[string]interface{}{
+		"error": "The specified device has disconnected from us.", "errorDomain": "CBErrorDomain", "errorCode": 7})
+}
+
+func (r *simRadio) disconnectWithError(c *simClient, by string, cbError map[string]interface{}) {
 	r.mu.Lock()
 	was := r.connected && c != nil && r.client == c
 	if was {
 		r.connected = false
 	}
+	r.stalling = false
+	if r.hangUp != nil {
+		r.hangUp.Stop()
+		r.hangUp = nil
+	}
 	r.mu.Unlock()
 	if c != nil {
-		c.send(map[string]interface{}{"type": "didDisconnect", "id": r.id, "error": "",
-			"timestamp": float64(time.Now().UnixNano())/1e9 - 978307200, "isReconnecting": false})
+		msg := map[string]interface{}{"type": "didDisconnect", "id": r.id, "error": "",
+			"timestamp": float64(time.Now().UnixNano())/1e9 - 978307200, "isReconnecting": false}
+		for k, v := range cbError {
+			msg[k] = v
+		}
+		c.send(msg)
 	}
 	if was {
 		log.Infof("pkg bluetooth; ** disconnected by the %s", by)

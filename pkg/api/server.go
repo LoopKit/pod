@@ -7,6 +7,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/avereha/pod/pkg/pod"
 	"github.com/gorilla/websocket"
@@ -173,6 +174,17 @@ func (s *Server) handleCommand(bytes []byte) error {
 			return err
 		}
 		s.pod.SetActiveTime(int(value))
+	case "failNextConnects":
+		if err := needValue("connect count", 0, 100); err != nil {
+			return err
+		}
+		hangUpAfter := 7.0
+		if v, ok := msg["hangUpAfter"].(float64); ok {
+			hangUpAfter = v
+		}
+		if err := s.pod.FailNextConnects(int(value), time.Duration(hangUpAfter*float64(time.Second))); err != nil {
+			return err
+		}
 	case "ignoreNextMessages":
 		if err := needValue("message count", 0, 100); err != nil {
 			return err
