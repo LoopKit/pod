@@ -35,6 +35,10 @@ type PODState struct {
 	FaultTime        uint16 `toml:"fault_time"`
 	Delivered        uint16 `toml:"delivered"`
 
+	// FaultBolusRemaining is the bolus a fault left undelivered. A faulted
+	// pod keeps reporting it, however late it is read.
+	FaultBolusRemaining uint16 `toml:"fault_bolus_remaining"`
+
 	TriggerTimes [8]uint16 `toml:"trigger_times"`
 
 	// At some point these could be replaced with details
@@ -116,8 +120,27 @@ func (p *PODState) MinutesActive() uint16 {
 	return uint16(time.Now().Sub(p.ActivationTime).Round(time.Minute).Minutes())
 }
 
+// SetFault stops the bolus where it is, so what it left undelivered is not
+// counted as delivered. Clearing the fault (0) forgets it.
+func (p *PODState) SetFault(code uint8) {
+	if code == 0 {
+		p.FaultBolusRemaining = 0
+	} else if p.FaultEvent == 0 {
+		remaining := p.BolusRemaining()
+		p.FaultBolusRemaining = remaining
+		p.Delivered -= remaining
+		p.Reservoir += remaining
+		p.BolusEnd = time.Time{}
+	}
+	p.FaultEvent = code
+	p.FaultTime = p.MinutesActive()
+}
+
 // NOTE: only handles immediate boluses; any extended bolus is not accounted for
 func (p *PODState) BolusRemaining() uint16 {
+	if p.FaultEvent != 0 {
+		return p.FaultBolusRemaining
+	}
 	now := time.Now()
 	var secondsPerPulse uint16
 	if p.BolusEnd.After(now) {
