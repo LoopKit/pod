@@ -173,6 +173,11 @@ func (s *Server) handleCommand(bytes []byte) error {
 			return err
 		}
 		s.pod.SetActiveTime(int(value))
+	case "ignoreNextMessages":
+		if err := needValue("message count", 0, 100); err != nil {
+			return err
+		}
+		s.pod.IgnoreNextMessages(int(value))
 	case "crashNextCommand":
 		beforeProcessing, ok := msg["beforeProcessing"].(bool)
 		if !ok {
