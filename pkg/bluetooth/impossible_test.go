@@ -244,3 +244,58 @@ func TestSimRadioServesAnOmnipod5(t *testing.T) {
 		t.Errorf("the pod serves %v, want the command characteristic and %s", got, o5DataCharUUID)
 	}
 }
+
+func TestSimRadioFailsTheNextConnectAtServiceDiscovery(t *testing.T) {
+	dir, err := ioutil.TempDir("/tmp", "podsim")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "impossible.sock")
+	const id = "11111111-2222-4333-8444-555555555555"
+	b, err := New(func(b *Ble) (Radio, error) { return NewSimRadio(b, path, id, nil) }, ProfileFor(ModeDash))
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	app := &fakeApp{t: t, conn: conn, in: bufio.NewScanner(conn)}
+	app.send(map[string]interface{}{"type": "hello", "bundleId": "org.loopkit.Loop", "pid": 0})
+	app.send(map[string]interface{}{"type": "scan"})
+	app.expect("didDiscover")
+
+	if err := b.FailNextConnects(1, 200*time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	app.send(map[string]interface{}{"type": "connect", "id": id})
+	app.expect("didConnect")
+	app.send(map[string]interface{}{"type": "discoverServices", "id": id})
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	for app.in.Scan() {
+		var msg map[string]interface{}
+		if err := json.Unmarshal(app.in.Bytes(), &msg); err != nil {
+			t.Fatal(err)
+		}
+		if msg["type"] == "didDiscoverServices" {
+			t.Fatal("answered service discovery on a failing connect")
+		}
+		if msg["type"] == "didDisconnect" {
+			if msg["errorDomain"] != "CBErrorDomain" || msg["errorCode"] != float64(7) {
+				t.Fatalf("hang-up %v", msg)
+			}
+			break
+		}
+	}
+	if b.IsConnected() {
+		t.Fatal("still connected after hanging up")
+	}
+
+	// Only the one connect fails.
+	app.send(map[string]interface{}{"type": "connect", "id": id})
+	app.expect("didConnect")
+	app.send(map[string]interface{}{"type": "discoverServices", "id": id})
+	app.expect("didDiscoverServices")
+}
