@@ -598,6 +598,7 @@ func (p *Pod) makeGeneralStatusResponse() response.Response {
 func (p *Pod) makeDetailedStatusResponse() response.Response {
 
 	var now = time.Now()
+	delivered, bolusRemaining := p.state.ReportedDelivery()
 
 	return &response.DetailedStatusResponse{
 		LastProgSeqNum:      p.state.LastProgSeqNum,
@@ -608,9 +609,9 @@ func (p *Pod) makeDetailedStatusResponse() response.Response {
 		BasalActive:         p.state.BasalActive,
 		ExtendedBolusActive: p.state.ExtendedBolusActive,
 		PodProgress:         p.state.PodProgress,
-		Delivered:           p.state.Delivered,
-		BolusRemaining:      p.state.BolusRemaining(),
-		MinutesActive:       p.state.MinutesActive(),
+		Delivered:           delivered,
+		BolusRemaining:      bolusRemaining,
+		MinutesActive:       p.state.ReportedMinutesActive(),
 		FaultEvent:          p.state.FaultEvent,
 		FaultEventTime:      p.state.FaultTime,
 	}
@@ -628,7 +629,7 @@ func (p *Pod) makeType3StatusResponse() response.Response {
 	return &response.Type3StatusResponse{
 		FaultEvent:     p.state.FaultEvent,
 		FaultEventTime: p.state.FaultTime,
-		MinutesActive:  p.state.MinutesActive(),
+		MinutesActive:  p.state.ReportedMinutesActive(),
 	}
 }
 

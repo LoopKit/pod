@@ -39,6 +39,9 @@ type PODState struct {
 	// pod keeps reporting it, however late it is read.
 	FaultBolusRemaining uint16 `toml:"fault_bolus_remaining"`
 
+	// ResetAt is when a reset fault restarted the pod's counters.
+	ResetAt time.Time `toml:"reset_at"`
+
 	TriggerTimes [8]uint16 `toml:"trigger_times"`
 
 	// At some point these could be replaced with details
@@ -134,6 +137,42 @@ func (p *PODState) SetFault(code uint8) {
 	}
 	p.FaultEvent = code
 	p.FaultTime = p.MinutesActive()
+	if IsResetFault(code) {
+		if p.ResetAt.IsZero() {
+			p.ResetAt = time.Now()
+		}
+		p.FaultTime = 0
+	} else {
+		p.ResetAt = time.Time{}
+	}
+}
+
+// IsResetFault is a fault that resets the pod. Its status then holds no
+// fault time, nothing delivered or left undelivered, and minutes counted
+// from the reset, as every reset in field reports does.
+func IsResetFault(code uint8) bool {
+	switch code {
+	case 0x0D, 0x0E, 0x0F, 0x10, 0x12, 0x22, 0x34, 0x3B, 0xAA, 0xD6, 0xD7:
+		return true
+	}
+	return false
+}
+
+// ReportedMinutesActive is the pod's minute counter, which a reset restarts.
+func (p *PODState) ReportedMinutesActive() uint16 {
+	if !p.ResetAt.IsZero() {
+		return uint16(time.Now().Sub(p.ResetAt).Round(time.Minute).Minutes())
+	}
+	return p.MinutesActive()
+}
+
+// ReportedDelivery is the delivered total and bolus remaining the pod
+// reports, both of which a reset clears.
+func (p *PODState) ReportedDelivery() (delivered uint16, bolusRemaining uint16) {
+	if !p.ResetAt.IsZero() {
+		return 0, 0
+	}
+	return p.Delivered, p.BolusRemaining()
 }
 
 // NOTE: only handles immediate boluses; any extended bolus is not accounted for
