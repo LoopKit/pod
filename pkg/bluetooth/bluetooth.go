@@ -355,6 +355,16 @@ func (b *Ble) ShutdownConnection() {
 	b.radio.Disconnect()
 }
 
+// HangUp ends the connection the way a pod does on its own. On a Bluetooth
+// adapter the phone already sees that as a remote close.
+func (b *Ble) HangUp() {
+	if r, ok := b.radio.(interface{ HangUp() }); ok {
+		r.HangUp()
+		return
+	}
+	b.radio.Disconnect()
+}
+
 // MTUShortfall reports a link too small to carry a packet of this profile.
 // The phone fragments a message into packets but does not fragment a packet,
 // so a short link truncates every write silently, and pairing stalls on the
