@@ -222,14 +222,7 @@ hciconfig                              # find the dongle, usually hci1
 ./pod -mode o5 -fresh -hci 1
 ```
 
-On a 4.2+ radio that still settles on 185, telling the controller to offer a long data
-length at connection setup is worth a try (the command does not exist before 4.2):
-
-```
-sudo hcitool -i hci0 cmd 0x08 0x0024 fb 00 48 03   # LE Write Suggested Default Data Length
-```
-
-Failing all of that, `-transport impossible` serves an app in the iOS Simulator over a
+Failing that, `-transport impossible` serves an app in the iOS Simulator over a
 socket, which carries whole packets and has no ATT MTU, so the radio stops mattering —
 see [Run against the iOS Simulator](#run-against-the-ios-simulator).
 

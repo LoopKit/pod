@@ -372,9 +372,9 @@ func (b *Ble) MTUShortfall() error {
 	return fmt.Errorf("the phone negotiated an ATT MTU of %d, below the %d an %s packet needs, "+
 		"so its writes would be truncated. A phone asks for more only of a Bluetooth 4.2 or "+
 		"later radio: check this one with `hciconfig hci0 version`, and if it is older, plug "+
-		"in a 4.2+ dongle and name it with -hci (it will not be hci0). On a 4.2+ radio, "+
-		"`sudo hcitool -i hci0 cmd 0x08 0x0024 fb 00 48 03` is worth a try. Or run the app in "+
-		"the iOS Simulator over -transport impossible, which has no MTU",
+		"in a 4.2+ dongle and name it with -hci (it will not be hci0). A Pi that reports "+
+		"older than it should be is usually missing its Bluetooth firmware: see the README. "+
+		"Or run the app in the iOS Simulator over -transport impossible, which has no MTU",
 		mtu, needed, b.profile.Mode.Description())
 }
 
