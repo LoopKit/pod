@@ -193,7 +193,7 @@ func (r *simRadio) connect(c *simClient) {
 			r.failConnects--
 			r.stalling = true
 			failing = true
-			r.hangUp = time.AfterFunc(r.hangUpAfter, func() { r.remoteHangUp(c) })
+			r.hangUp = time.AfterFunc(r.hangUpAfter, func() { r.remoteHangUp(c, "pod (failNextConnects)") })
 		}
 	}
 	r.mu.Unlock()
@@ -452,10 +452,19 @@ func (r *simRadio) isStalling() bool {
 	return r.stalling
 }
 
-// remoteHangUp ends a failing connection the way a pod does, with
+// HangUp is the pod ending the connection on its own, with
+// CBErrorPeripheralDisconnected as the phone sees a pod's hang-up.
+func (r *simRadio) HangUp() {
+	r.mu.Lock()
+	c := r.client
+	r.mu.Unlock()
+	r.remoteHangUp(c, "pod")
+}
+
+// remoteHangUp ends a connection the way a pod does, with
 // CBErrorPeripheralDisconnected.
-func (r *simRadio) remoteHangUp(c *simClient) {
-	r.disconnectWithError(c, "pod (failNextConnects)", map[string]interface{}{
+func (r *simRadio) remoteHangUp(c *simClient, by string) {
+	r.disconnectWithError(c, by, map[string]interface{}{
 		"error": "The specified device has disconnected from us.", "errorDomain": "CBErrorDomain", "errorCode": 7})
 }
 

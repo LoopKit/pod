@@ -190,6 +190,12 @@ func (s *Server) handleCommand(bytes []byte) error {
 			return err
 		}
 		s.pod.IgnoreNextMessages(int(value))
+	case "hangUpOnNextMessages":
+		if err := needValue("message count", 0, 100); err != nil {
+			return err
+		}
+		afterAnswering, _ := msg["afterAnswering"].(bool)
+		s.pod.HangUpOnNextMessages(int(value), afterAnswering)
 	case "crashNextCommand":
 		beforeProcessing, ok := msg["beforeProcessing"].(bool)
 		if !ok {
