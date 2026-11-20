@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/avereha/pod/pkg/message"
+	"github.com/avereha/pod/pkg/response"
 	"github.com/davecgh/go-spew/spew"
 	log "github.com/sirupsen/logrus"
 )
@@ -41,8 +42,6 @@ type Radio interface {
 	// transport has none to report.
 	LinkMTU() int
 }
-
-const AdvertisedName = " :: Fake POD ::"
 
 // AdvertState is what a paired pod advertises of its state: its fault
 // code and its firing alert slots, 0 when there are none.
@@ -86,17 +85,21 @@ func AdvertisedServices(podId []byte, state AdvertState) []uint16 {
 		idTwo = binary.BigEndian.Uint16(podId[2:4])
 		second = state.status()
 	}
+
+	// The DASH service UUID includes the lot and tid
+	// that are returned in the version responses.
+	lot := response.LotDash
+	tid := response.TidDash
 	return []uint16{
 		0x4024,
 		second,
 		0x000a,
 		idOne,
 		idTwo,
-		// these 4 are copied from lotNo and lotSeq from fixed string in versionresponse.go
-		0x0814,
-		0x6DB1,
-		0x0006,
-		0xE451,
+		uint16(lot >> 16),
+		uint16(lot),
+		uint16(tid >> 16),
+		uint16(tid),
 	}
 }
 
