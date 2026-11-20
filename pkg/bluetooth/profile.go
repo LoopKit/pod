@@ -136,19 +136,15 @@ func O5PdmIdFromHello(cmd []byte) (uint32, bool) {
 	return binary.BigEndian.Uint32(cmd[3:7]), true
 }
 
+const FakePodAdvertisedName = ":: Fake Pod ::"
+
 // AdvertisedName is the local name the pod puts in its advertisement, or in
 // its scan response when a 128-bit service UUID has filled the advertisement.
 //
 // A real Omnipod 5 names itself "AP <controller id> <lot><tid>", captured from
-// a pod as "AP FFFFFFFE 0E977731000A3AB7" before it was paired. Nothing reads
-// the name, so a simulated one just says what it is. A DASH keeps the name
-// this simulator has always used.
+// a pod as "AP FFFFFFFE 0E977731000A3AB7" before it was paired and then changes
+// it to a short fixed string like "OP5POD" or "NXP BLE" after pairing.
+// Nothing reads this during pairing, so a simulated pod just says what it is.
 func (p Profile) AdvertisedName() string {
-	if p.Mode.IsO5() {
-		return O5AdvertisedName
-	}
-	return AdvertisedName
+	return FakePodAdvertisedName
 }
-
-// O5AdvertisedName is the local name a simulated Omnipod 5 advertises.
-const O5AdvertisedName = "pod simulator"
