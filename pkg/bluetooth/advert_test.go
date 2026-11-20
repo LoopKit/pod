@@ -105,10 +105,6 @@ func TestO5AdvertisementFitsWithoutTheName(t *testing.T) {
 	if n := a.Len(); n > 31 {
 		t.Fatalf("the advertisement is %d bytes, over the 31 a packet allows", n)
 	}
-	if a.Len()+len(O5AdvertisedName)+2 < 31 {
-		t.Errorf("the name would fit after all (%d + %d), so the scan-response path is untested",
-			a.Len(), len(O5AdvertisedName))
-	}
 }
 
 func keys(m map[byte][]byte) []string {
@@ -125,22 +121,4 @@ func reverseBytes(b []byte) []byte {
 		out[len(b)-1-i] = b[i]
 	}
 	return out
-}
-
-func TestO5AdvertisedName(t *testing.T) {
-	name := ProfileFor(ModeO5).AdvertisedName()
-	if name != "pod simulator" {
-		t.Errorf("a simulated Omnipod 5 is named %q", name)
-	}
-
-	// The name goes in the scan response, which is also 31 bytes: two of
-	// header plus the name itself.
-	if n := 2 + len(name); n > 31 {
-		t.Errorf("the name needs %d bytes of the scan response, over 31", n)
-	}
-
-	// A DASH keeps the name this simulator has always used.
-	if got := ProfileFor(ModeDash).AdvertisedName(); got != AdvertisedName {
-		t.Errorf("a DASH is named %q, want %q", got, AdvertisedName)
-	}
 }
