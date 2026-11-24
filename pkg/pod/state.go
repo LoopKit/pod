@@ -136,6 +136,22 @@ func (p *PODState) SetFault(code uint8) {
 	p.FaultTime = p.MinutesActive()
 }
 
+// Deactivate stops all delivery and leaves the pod inactive. A bolus still
+// running is cut short, so what it left undelivered goes back to the reservoir.
+// A faulted pod already stopped its bolus in SetFault.
+func (p *PODState) Deactivate() {
+	if p.FaultEvent == 0 {
+		remaining := p.BolusRemaining()
+		p.Delivered -= remaining
+		p.Reservoir += remaining
+	}
+	p.BolusEnd = time.Time{}
+	p.ExtendedBolusActive = false
+	p.TempBasalEnd = time.Time{}
+	p.BasalActive = false
+	p.PodProgress = response.PodProgressPodInactive
+}
+
 // NOTE: only handles immediate boluses; any extended bolus is not accounted for
 func (p *PODState) BolusRemaining() uint16 {
 	if p.FaultEvent != 0 {

@@ -674,7 +674,11 @@ func (p *Pod) getResponse(cmd command.Command) response.Response {
 
 	getStatus, isStatusRequest := cmd.(*command.GetStatus)
 	if p.state.MinutesActive() >= 80*60 && p.state.FaultEvent == 0 {
-		p.state.FaultEvent = 0x1C // 0x1C = exceeded maximum pod life of 80 hours
+		// 0x1C = exceeded maximum pod life of 80 hours. SetFault stops any
+		// bolus, and the fault happened at 80 hours even if the pod isn't
+		// asked until later.
+		p.state.SetFault(0x1C)
+		p.state.FaultTime = 80 * 60
 	}
 	if !isStatusRequest || getStatus.RequestType == 0 || getStatus.RequestType == 7 {
 		// Not a get status command or a type 0 or type 7 get status
@@ -812,7 +816,10 @@ func (p *Pod) handleCommand(cmd command.Command) {
 			p.state.BasalActive = false
 		}
 
-	default: // includes 0x08, 0x1C, 0x1E
+	case *command.Deactivate: // 0x1C
+		p.state.Deactivate()
+
+	default: // includes 0x08, 0x1E
 		// No action
 	}
 
