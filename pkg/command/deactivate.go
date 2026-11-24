@@ -21,7 +21,7 @@ func (g *Deactivate) GetSeq() uint8 {
 }
 
 func (g *Deactivate) IsResponseHardcoded() bool {
-	return true
+	return false
 }
 
 func (g *Deactivate) DoesMutatePodState() bool {
