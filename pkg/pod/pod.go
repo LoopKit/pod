@@ -48,6 +48,8 @@ type Pod struct {
 var crashBeforeProcessingCommand bool
 var crashAfterProcessingCommand bool
 var ignoreMessages int
+var hangUpMessages int
+var hangUpAfterAnswering bool
 
 func New(ble *bluetooth.Ble, state *PODState) *Pod {
 	ret := &Pod{
@@ -350,6 +352,20 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 			continue
 		}
 
+		p.mtx.Lock()
+		hangUp := hangUpMessages > 0
+		if hangUp {
+			hangUpMessages--
+		}
+		hangUpAfter := hangUp && hangUpAfterAnswering
+		p.mtx.Unlock()
+		if hangUp && !hangUpAfter {
+			log.Infof("pkg pod; hanging up on message seq %d without answering (hangUpOnNextMessages)", msg.SequenceNumber)
+			p.ble.HangUp()
+			go p.StartAcceptingCommands()
+			return
+		}
+
 		if msg.SequenceNumber == lastMsgSeq {
 			// this is a retry because we did not answer yet
 			// ignore duplicate commands/mesages
@@ -537,6 +553,12 @@ func (p *Pod) CommandLoop(pMsg PodMsgBody) {
 
 		log.Debugf("notifyingStateChange")
 		p.notifyStateChange()
+		if hangUpAfter {
+			log.Infof("pkg pod; hanging up after answering message seq %d (hangUpOnNextMessages)", lastMsgSeq)
+			p.ble.HangUp()
+			go p.StartAcceptingCommands()
+			return
+		}
 	}
 }
 
@@ -653,7 +675,11 @@ func (p *Pod) getResponse(cmd command.Command) response.Response {
 
 	getStatus, isStatusRequest := cmd.(*command.GetStatus)
 	if p.state.MinutesActive() >= 80*60 && p.state.FaultEvent == 0 {
-		p.state.FaultEvent = 0x1C // 0x1C = exceeded maximum pod life of 80 hours
+		// 0x1C = exceeded maximum pod life of 80 hours. SetFault stops any
+		// bolus, and the fault happened at 80 hours even if the pod isn't
+		// asked until later.
+		p.state.SetFault(0x1C)
+		p.state.FaultTime = 80 * 60
 	}
 	if !isStatusRequest || getStatus.RequestType == 0 || getStatus.RequestType == 7 {
 		// Not a get status command or a type 0 or type 7 get status
@@ -791,7 +817,10 @@ func (p *Pod) handleCommand(cmd command.Command) {
 			p.state.BasalActive = false
 		}
 
-	default: // includes 0x08, 0x1C, 0x1E
+	case *command.Deactivate: // 0x1C
+		p.state.Deactivate()
+
+	default: // includes 0x08, 0x1E
 		// No action
 	}
 
@@ -852,6 +881,17 @@ func (p *Pod) SetActiveTime(newVal int) {
 func (p *Pod) IgnoreNextMessages(count int) {
 	p.mtx.Lock()
 	ignoreMessages = count
+	p.mtx.Unlock()
+}
+
+// HangUpOnNextMessages makes the pod hang up on each of the next count
+// messages: without answering, as a pod that drops the link during a
+// command does, or once the phone has acknowledged the answer, as a pod
+// that hangs up soon after a command does.
+func (p *Pod) HangUpOnNextMessages(count int, afterAnswering bool) {
+	p.mtx.Lock()
+	hangUpMessages = count
+	hangUpAfterAnswering = afterAnswering
 	p.mtx.Unlock()
 }
 

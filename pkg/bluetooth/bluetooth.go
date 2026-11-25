@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/avereha/pod/pkg/message"
+	"github.com/avereha/pod/pkg/response"
 	"github.com/davecgh/go-spew/spew"
 	log "github.com/sirupsen/logrus"
 )
@@ -41,8 +42,6 @@ type Radio interface {
 	// transport has none to report.
 	LinkMTU() int
 }
-
-const AdvertisedName = " :: Fake POD ::"
 
 // AdvertState is what a paired pod advertises of its state: its fault
 // code and its firing alert slots, 0 when there are none.
@@ -86,17 +85,21 @@ func AdvertisedServices(podId []byte, state AdvertState) []uint16 {
 		idTwo = binary.BigEndian.Uint16(podId[2:4])
 		second = state.status()
 	}
+
+	// The DASH service UUID includes the lot and tid
+	// that are returned in the version responses.
+	lot := response.LotDash
+	tid := response.TidDash
 	return []uint16{
 		0x4024,
 		second,
 		0x000a,
 		idOne,
 		idTwo,
-		// these 4 are copied from lotNo and lotSeq from fixed string in versionresponse.go
-		0x0814,
-		0x6DB1,
-		0x0006,
-		0xE451,
+		uint16(lot >> 16),
+		uint16(lot),
+		uint16(tid >> 16),
+		uint16(tid),
 	}
 }
 
@@ -355,6 +358,16 @@ func (b *Ble) ShutdownConnection() {
 	b.radio.Disconnect()
 }
 
+// HangUp ends the connection the way a pod does on its own. On a Bluetooth
+// adapter the phone already sees that as a remote close.
+func (b *Ble) HangUp() {
+	if r, ok := b.radio.(interface{ HangUp() }); ok {
+		r.HangUp()
+		return
+	}
+	b.radio.Disconnect()
+}
+
 // MTUShortfall reports a link too small to carry a packet of this profile.
 // The phone fragments a message into packets but does not fragment a packet,
 // so a short link truncates every write silently, and pairing stalls on the
@@ -372,9 +385,9 @@ func (b *Ble) MTUShortfall() error {
 	return fmt.Errorf("the phone negotiated an ATT MTU of %d, below the %d an %s packet needs, "+
 		"so its writes would be truncated. A phone asks for more only of a Bluetooth 4.2 or "+
 		"later radio: check this one with `hciconfig hci0 version`, and if it is older, plug "+
-		"in a 4.2+ dongle and name it with -hci (it will not be hci0). On a 4.2+ radio, "+
-		"`sudo hcitool -i hci0 cmd 0x08 0x0024 fb 00 48 03` is worth a try. Or run the app in "+
-		"the iOS Simulator over -transport impossible, which has no MTU",
+		"in a 4.2+ dongle and name it with -hci (it will not be hci0). A Pi that reports "+
+		"older than it should be is usually missing its Bluetooth firmware: see the README. "+
+		"Or run the app in the iOS Simulator over -transport impossible, which has no MTU",
 		mtu, needed, b.profile.Mode.Description())
 }
 

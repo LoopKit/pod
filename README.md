@@ -8,7 +8,7 @@ Fake pod implementation
 
 * This version also mimics a behavior we see in some DASH pods where the pod disconnects every 3 minutes; this can be used with iOS hooks to make a heartbeat to run Loop in situations where a BLE CGM is not available. 
 
-* It serves a control panel at http://<host>:8080/ (`-api` changes the address): the pod's reservoir, delivery, age, alerts and fault, with controls to set the reservoir and pod age, raise alerts, trigger or clear a fault, and crash on the next command to test unacknowledged commands. The panel drives a JSON API: `GET /status`, and `POST /command` with `{"command": "changeReservoir", "value": 45}` (also `setActiveTime` in minutes, `setAlerts` as a slot mask, `setFault` with a fault code, 0 to clear, `crashNextCommand` with `"beforeProcessing": true|false`, `ignoreNextMessages` with a count, which keeps the link up but leaves that many messages unanswered, as a pod that didn't hear them would, and `failNextConnects` with a count and an optional `hangUpAfter` in seconds, 7 by default, which leaves service discovery unanswered on that many connects and then hangs up with CoreBluetooth's "peripheral disconnected" error, as some pods do in the field; this needs `-transport impossible` and an ImpossiBLE that passes `errorDomain` and `errorCode` through on a disconnect). A fault stops a bolus in progress, and the pod reports the part left undelivered however late it is read, as a real pod does. A reset fault (0x0D, 0x0E, 0x0F, 0x10, 0x12, 0x1E, 0x22, 0x34, 0x36, 0x3B, 0x4F, 0xD6 or 0xD7) reports what a reset pod does instead: no fault time (0x0000 on a DASH, 0xFFFF on an Omnipod 5, which has been seen reporting both), nothing delivered or left undelivered, and minutes active counted from the reset.
+* It serves a control panel at http://<host>:8080/ (`-api` changes the address): the pod's reservoir, delivery, age, alerts and fault, with controls to set the reservoir and pod age, raise alerts, trigger or clear a fault, and crash on the next command to test unacknowledged commands. The panel drives a JSON API: `GET /status`, and `POST /command` with `{"command": "changeReservoir", "value": 45}` (also `setActiveTime` in minutes, `setAlerts` as a slot mask, `setFault` with a fault code, 0 to clear, `crashNextCommand` with `"beforeProcessing": true|false`, `ignoreNextMessages` with a count, which keeps the link up but leaves that many messages unanswered, as a pod that didn't hear them would, `hangUpOnNextMessages` with a count, which hangs up without answering when each of that many messages arrives, as a pod that drops the link during a command does, or with `"afterAnswering": true` once the phone has acknowledged the answer, and `failNextConnects` with a count and an optional `hangUpAfter` in seconds, 7 by default, which leaves service discovery unanswered on that many connects and then hangs up with CoreBluetooth's "peripheral disconnected" error, as some pods do in the field; this needs `-transport impossible` and an ImpossiBLE that passes `errorDomain` and `errorCode` through on a disconnect). A fault stops a bolus in progress, and the pod reports the part left undelivered however late it is read, as a real pod does. A reset fault (0x0D, 0x0E, 0x0F, 0x10, 0x12, 0x1E, 0x22, 0x34, 0x36, 0x3B, 0x4F, 0xD6 or 0xD7) reports what a reset pod does instead: no fault time (0x0000 on a DASH, 0xFFFF on an Omnipod 5, which has been seen reporting both), nothing delivered or left undelivered, and minutes active counted from the reset.
 
 * The websocket API at `/ws`, used by the separate [NodeJS/React frontend](https://github.com/ps2/pod_simulator_frontend), is still there.
 
@@ -222,14 +222,7 @@ hciconfig                              # find the dongle, usually hci1
 ./pod -mode o5 -fresh -hci 1
 ```
 
-On a 4.2+ radio that still settles on 185, telling the controller to offer a long data
-length at connection setup is worth a try (the command does not exist before 4.2):
-
-```
-sudo hcitool -i hci0 cmd 0x08 0x0024 fb 00 48 03   # LE Write Suggested Default Data Length
-```
-
-Failing all of that, `-transport impossible` serves an app in the iOS Simulator over a
+Failing that, `-transport impossible` serves an app in the iOS Simulator over a
 socket, which carries whole packets and has no ATT MTU, so the radio stops mattering —
 see [Run against the iOS Simulator](#run-against-the-ios-simulator).
 
