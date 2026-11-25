@@ -1,6 +1,7 @@
 package bluetooth
 
 import (
+	"bytes"
 	"encoding/hex"
 	"fmt"
 	"sync"
@@ -33,17 +34,43 @@ type gattRadio struct {
 }
 
 // ServerOptions is how the pod serves itself from adapter hci<n>, or from
-// the first one with LE support when n is negative.
-func ServerOptions(hci int) []gatt.Option {
+// the first one with LE support when n is negative. With randomAddress, it
+// advertises from the random address set after the device is opened instead
+// of the adapter's own address.
+func ServerOptions(hci int, randomAddress bool) []gatt.Option {
+	var ownAddressType uint8 // 0x00: public
+	if randomAddress {
+		ownAddressType = 0x01 // random
+	}
 	return []gatt.Option{
 		gatt.LnxMaxConnections(1),
 		gatt.LnxDeviceID(hci, true),
 		gatt.LnxSetAdvertisingParameters(&cmd.LESetAdvertisingParameters{
 			AdvertisingIntervalMin: 0x00f4,
 			AdvertisingIntervalMax: 0x00f4,
+			OwnAddressType:         ownAddressType,
 			AdvertisingChannelMap:  0x7,
 		}),
 	}
+}
+
+// setRandomAddress gives the adapter the pod's own address. Opening the device
+// resets the adapter, which clears any random address, and the advertising
+// parameters only go to the adapter when the pod first advertises. So this
+// goes after gatt.NewDevice and before the first advertisement.
+func setRandomAddress(d gatt.Device, address string) error {
+	a, err := ParseStaticAddress(address)
+	if err != nil {
+		return err
+	}
+	var rsp bytes.Buffer
+	if err := d.Option(gatt.LnxSendHCIRawCommand(cmd.LESetRandomAddress{RandomAddress: a}, &rsp)); err != nil {
+		return fmt.Errorf("could not set the Bluetooth address to %s: %w", address, err)
+	}
+	if rsp.Len() == 0 || rsp.Bytes()[0] != 0x00 {
+		return fmt.Errorf("the adapter refused Bluetooth address %s: response [% X]", address, rsp.Bytes())
+	}
+	return nil
 }
 
 // NewGattRadio serves the pod from Bluetooth adapter hci<hci>, or from the
@@ -51,10 +78,21 @@ func ServerOptions(hci int) []gatt.Option {
 // an Omnipod 5 needs a 247-byte ATT MTU, which a phone asks for only of a
 // Bluetooth 4.2 or later radio, so a Pi 3B's own 4.1 radio will not do and
 // a dongle has to be named here rather than left to chance.
-func NewGattRadio(b *Ble, podId []byte, hci int) (Radio, error) {
-	d, err := gatt.NewDevice(ServerOptions(hci)...)
+//
+// address is the pod's own random static address, or empty to use the
+// adapter's address, as a pod from an older state file does.
+func NewGattRadio(b *Ble, podId []byte, hci int, address string) (Radio, error) {
+	d, err := gatt.NewDevice(ServerOptions(hci, address != "")...)
 	if err != nil {
 		log.Fatalf("pkg bluetooth; failed to open device, err: %s", err)
+	}
+	if address != "" {
+		if err := setRandomAddress(d, address); err != nil {
+			log.Fatalf("pkg bluetooth; %s", err)
+		}
+		log.Infof("pkg bluetooth; serving the pod from its own address %s", address)
+	} else {
+		log.Infof("pkg bluetooth; serving the pod from the adapter's address; use -fresh to give a new pod its own")
 	}
 	r := &gattRadio{device: d, profile: b.profile, podId: podId}
 
