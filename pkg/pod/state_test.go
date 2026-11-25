@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/avereha/pod/pkg/bluetooth"
 	"github.com/avereha/pod/pkg/response"
 )
 
@@ -90,6 +91,31 @@ func TestAResetFaultClearsWhatThePodReports(t *testing.T) {
 	s.SetFault(0)
 	if !s.ResetAt.IsZero() || s.ReportedMinutesActive() != 18 {
 		t.Fatalf("clearing the fault left reset at %v, minutes active %d", s.ResetAt, s.ReportedMinutesActive())
+	}
+}
+
+func TestAnO5ResetFaultHasFaultTimeFFFF(t *testing.T) {
+	s := &PODState{
+		Mode:           string(bluetooth.ModeO5),
+		PodProgress:    response.PodProgressRunningAbove50U,
+		ActivationTime: time.Now().Add(-18 * time.Minute),
+	}
+	s.SetFault(0x34)
+	if s.FaultTime != 0xFFFF {
+		t.Fatalf("O5 reset fault time %04x, want ffff", s.FaultTime)
+	}
+}
+
+func TestResetFaultCodes(t *testing.T) {
+	for _, code := range []uint8{0x0D, 0x0E, 0x0F, 0x10, 0x12, 0x1E, 0x22, 0x34, 0x36, 0x3B, 0x4F, 0xD6, 0xD7} {
+		if !IsResetFault(code) {
+			t.Errorf("0x%02X is a reset fault", code)
+		}
+	}
+	for _, code := range []uint8{0x14, 0x18, 0x1C, 0x31, 0xAA} {
+		if IsResetFault(code) {
+			t.Errorf("0x%02X is not a known reset fault", code)
+		}
 	}
 }
 

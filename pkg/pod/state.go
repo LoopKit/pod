@@ -141,7 +141,12 @@ func (p *PODState) SetFault(code uint8) {
 		if p.ResetAt.IsZero() {
 			p.ResetAt = time.Now()
 		}
+		// An Omnipod 5 has reported both 0x0000 and 0xFFFF; 0xFFFF sets it
+		// apart from a DASH.
 		p.FaultTime = 0
+		if p.PodMode().IsO5() {
+			p.FaultTime = 0xFFFF
+		}
 	} else {
 		p.ResetAt = time.Time{}
 	}
@@ -152,7 +157,7 @@ func (p *PODState) SetFault(code uint8) {
 // from the reset, as every reset in field reports does.
 func IsResetFault(code uint8) bool {
 	switch code {
-	case 0x0D, 0x0E, 0x0F, 0x10, 0x12, 0x22, 0x34, 0x3B, 0xAA, 0xD6, 0xD7:
+	case 0x0D, 0x0E, 0x0F, 0x10, 0x12, 0x1E, 0x22, 0x34, 0x36, 0x3B, 0x4F, 0xD6, 0xD7:
 		return true
 	}
 	return false
