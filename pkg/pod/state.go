@@ -52,6 +52,12 @@ type PODState struct {
 	// PeripheralID is the identifier the iOS Simulator transport gives the pod.
 	PeripheralID string `toml:"peripheral_id"`
 
+	// BleAddress is the random static address the pod serves itself from over
+	// a Bluetooth adapter, so that each fresh pod is a new device to the phone.
+	// It is empty in a state file written before pods had their own address,
+	// and that pod keeps the adapter's address so the phone still finds it.
+	BleAddress string `toml:"ble_address"`
+
 	// Mode is the kind of pod being simulated, "dash" or "o5". It is kept
 	// with the state so that restarting the simulator does not change the
 	// pod the phone paired with.
@@ -81,6 +87,7 @@ func NewFreshState(filename string, mode bluetooth.Mode) *PODState {
 		ActivationTime: time.Now(),
 		Filename:       filename,
 		Mode:           string(mode),
+		BleAddress:     bluetooth.RandomStaticAddress(),
 	}
 }
 

@@ -72,7 +72,9 @@ func main() {
 	var attach func(*bluetooth.Ble) (bluetooth.Radio, error)
 	switch *transport {
 	case "ble":
-		attach = func(b *bluetooth.Ble) (bluetooth.Radio, error) { return bluetooth.NewGattRadio(b, state.Id, *hci) }
+		attach = func(b *bluetooth.Ble) (bluetooth.Radio, error) {
+			return bluetooth.NewGattRadio(b, state.Id, *hci, state.BleAddress)
+		}
 	case "impossible":
 		attach = func(b *bluetooth.Ble) (bluetooth.Radio, error) {
 			return bluetooth.NewSimRadio(b, *socket, state.PeripheralID, state.Id)
